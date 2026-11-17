@@ -112,6 +112,7 @@ struct Checker<'a, 'program> {
     returns: HashMap<&'a str, Variable>,
     flows: Vec<TypeFlow>,
     arguments: Vec<((&'a str, &'a str), Variable, Position)>,
+    indexes: Vec<(Variable, Position)>,
 }
 
 pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> {
@@ -121,6 +122,7 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
         returns: HashMap::new(),
         flows: Vec::new(),
         arguments: Vec::new(),
+        indexes: Vec::new(),
     };
     let mut routine_names = HashSet::from([program.main.name.0]);
     if builtins::signature(program.main.name.0).is_some() {
@@ -173,6 +175,11 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
             .map(|(parameter, actual, at)| (parameters[&parameter], actual, at)),
     );
     checker.constraints.propagate(&checker.flows)?;
+    for (index, at) in checker.indexes {
+        if checker.constraints.possibilities(index) & NUMERIC == 0 {
+            return Err(at.error("El subíndice debe ser numérico."));
+        }
+    }
     Ok(main_types)
 }
 
@@ -248,7 +255,9 @@ impl<'a> Checker<'a, '_> {
         }
         if let Some(indexes) = indexes {
             for expr in indexes {
-                self.expect(scope, expr, NUMERIC)?;
+                // A numeric check does not narrow ambiguous input used as an array key.
+                let index = self.expression(scope, expr)?;
+                self.indexes.push((index, expr.1));
             }
         }
         Ok(variable)
@@ -371,7 +380,7 @@ impl<'a> Checker<'a, '_> {
             Expression::Literal(Value::Number(_)) => self.constraints.new(NUMERIC),
             Expression::Literal(Value::Logic(_)) => self.constraints.new(LOGIC),
             Expression::Literal(Value::Text(_)) => self.constraints.new(TEXT),
-            Expression::Literal(Value::Empty | Value::Input(_)) => self.constraints.new(ALL),
+            Expression::Literal(Value::Empty | Value::Input(..)) => self.constraints.new(ALL),
             Expression::Variable(place) => {
                 if self.routine(place.0.0).is_some() || builtins::signature(place.0.0).is_some() {
                     self.call(scope, place, true)?

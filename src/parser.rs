@@ -9,13 +9,47 @@ pub(crate) enum Type {
     Text,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypeSet(u8);
+
+impl TypeSet {
+    pub const NUMBER: Self = Self(1);
+    pub const LOGIC: Self = Self(2);
+    pub const TEXT: Self = Self(4);
+    pub const ANY: Self = Self(7);
+    pub const TEXT_OR_NUMBER: Self = Self(Self::TEXT.0 | Self::NUMBER.0);
+    pub const TEXT_OR_LOGIC: Self = Self(Self::TEXT.0 | Self::LOGIC.0);
+
+    pub fn of(ty: Type) -> Self {
+        match ty {
+            Type::Integer | Type::Real => Self::NUMBER,
+            Type::Logic => Self::LOGIC,
+            Type::Text => Self::TEXT,
+        }
+    }
+
+    pub fn intersection(self, other: Self) -> Option<Self> {
+        let shared = self.0 & other.0;
+        (shared != 0).then_some(Self(shared))
+    }
+
+    pub fn known(self) -> Option<Type> {
+        match self {
+            Self::NUMBER => Some(Type::Real),
+            Self::LOGIC => Some(Type::Logic),
+            Self::TEXT => Some(Type::Text),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) enum Value {
     Number(f64),
     Logic(bool),
     Text(String),
     Empty,
-    Input(String),
+    Input(String, TypeSet),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -461,7 +495,7 @@ impl<'a> Parser<'a> {
         Ok(names)
     }
 
-    fn loop_body_start(&mut self, hacer: bool) -> Result<(), Diagnostic> {
+    fn body_start(&mut self, hacer: bool) -> Result<(), Diagnostic> {
         if hacer {
             self.skip_ends();
             Ok(())
@@ -478,7 +512,7 @@ impl<'a> Parser<'a> {
             }
             let array = self.name()?;
             let hacer = self.word("HACER");
-            self.loop_body_start(hacer)?;
+            self.body_start(hacer)?;
             let body = self.block(&["PARA"], Stop::End)?;
             self.closing(&["PARA"])?;
             return Ok(Statement::ForEach(name, array, body));
@@ -507,7 +541,7 @@ impl<'a> Parser<'a> {
         } else {
             early_step
         };
-        self.loop_body_start(hacer)?;
+        self.body_start(hacer)?;
         let body = self.block(&["PARA"], Stop::End)?;
         self.closing(&["PARA"])?;
         Ok(Statement::For(name, first, last, step, body))
@@ -515,8 +549,8 @@ impl<'a> Parser<'a> {
 
     fn switch(&mut self) -> Result<Statement<'a>, Diagnostic> {
         let selector = self.expr()?;
-        self.word("HACER");
-        self.newline()?;
+        let hacer = self.word("HACER");
+        self.body_start(hacer)?;
         let mut cases = Vec::new();
         while !self.is_closing("SEGUN") && !self.is_closing("SEGÚN") {
             let mut labels = Vec::new();
@@ -611,7 +645,7 @@ impl<'a> Parser<'a> {
         } else if self.word("MIENTRAS") {
             let condition = self.expr()?;
             let hacer = self.word("HACER");
-            self.loop_body_start(hacer)?;
+            self.body_start(hacer)?;
             let body = self.block(&["MIENTRAS"], Stop::End)?;
             self.closing(&["MIENTRAS"])?;
             Statement::While(condition, body)

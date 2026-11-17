@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::builtins::{self, Random, decimal, display_number};
 use crate::check::Types;
 use crate::parser::{
-    Expr, Expression, Line, Name, Op, Passage, Place, Program, Statement, Type, Value,
+    Expr, Expression, Line, Name, Op, Passage, Place, Program, Statement, Type, TypeSet, Value,
 };
 use crate::{CallSite, Diagnostic, Host, MAX_NESTING, Position, Step, Variable};
 
@@ -36,11 +36,30 @@ pub(crate) fn execute<'a>(
 type Frame<'a> = HashMap<&'a str, Address>;
 
 struct Slot {
-    ty: Option<Type>,
+    types: TypeSet,
+    integer: bool,
     declared: bool,
     scalar: Value,
     used: bool,
     array: Option<Array>,
+}
+
+impl Slot {
+    fn ty(&self) -> Option<Type> {
+        if self.integer {
+            Some(Type::Integer)
+        } else {
+            self.types.known()
+        }
+    }
+
+    fn constrain(&mut self, allowed: TypeSet, at: Position) -> Result<(), Diagnostic> {
+        self.types = self
+            .types
+            .intersection(allowed)
+            .ok_or_else(|| at.error("No coinciden los tipos."))?;
+        Ok(())
+    }
 }
 
 struct Array {
@@ -57,7 +76,8 @@ struct Address {
 impl Address {
     fn new(ty: Option<Type>, scalar: Value) -> Self {
         let slot = Rc::new(RefCell::new(Slot {
-            ty,
+            types: ty.map_or_else(|| scalar.possible_types(), TypeSet::of),
+            integer: ty == Some(Type::Integer),
             scalar,
             declared: false,
             used: false,
@@ -71,7 +91,7 @@ impl Address {
     }
 
     fn ty(&self) -> Option<Type> {
-        self.slot.borrow().ty
+        self.slot.borrow().ty()
     }
 
     fn get(&self, at: Position) -> Result<Value, Diagnostic> {
@@ -86,26 +106,23 @@ impl Address {
             None => &slot.scalar,
         };
         Ok(match value {
-            Value::Empty => slot.ty.map_or(Value::Empty, Type::default_value),
-            Value::Input(text) => match slot.ty {
+            Value::Empty => slot.ty().map_or(Value::Empty, Type::default_value),
+            Value::Input(text, _) => match slot.ty() {
                 Some(Type::Real | Type::Integer) => Value::Number(value.as_number(at)?),
                 Some(Type::Logic) => Value::Logic(value.as_bool(at)?),
                 Some(Type::Text) => Value::Text(text.clone()),
-                None => value.clone(),
+                None => Value::Input(text.clone(), slot.types),
             },
             value => value.clone(),
         })
     }
 
-    fn constrain(&self, ty: Type, at: Position) -> Result<(), Diagnostic> {
-        let mut slot = self.slot.borrow_mut();
-        match slot.ty {
-            None => slot.ty = Some(ty),
-            Some(Type::Integer) if ty == Type::Real => {}
-            Some(actual) if actual == ty => {}
-            _ => return Err(at.error("No coinciden los tipos.")),
-        }
-        Ok(())
+    fn copy(&self, at: Position) -> Result<Self, Diagnostic> {
+        let value = self.get(at)?;
+        let slot = self.slot.borrow();
+        let copy = Self::new(slot.ty(), value);
+        copy.slot.borrow_mut().types = slot.types;
+        Ok(copy)
     }
 
     fn set(&self, value: Value, at: Position) -> Result<(), Diagnostic> {
@@ -114,35 +131,15 @@ impl Address {
 
     fn store(&self, value: Value, at: Position, check_integer: bool) -> Result<(), Diagnostic> {
         let mut slot = self.slot.borrow_mut();
-        if let Some(ty) = slot.ty {
-            if !ty.accepts(&value) {
-                if ty == Type::Integer && matches!(value, Value::Number(_)) {
-                    if check_integer {
-                        return Err(at.error(
-                            "No coinciden los tipos, el valor a asignar debe ser un entero.",
-                        ));
-                    }
-                } else {
-                    return Err(at.error("No coinciden los tipos."));
-                }
+        if check_integer && slot.integer && !Type::Integer.accepts(&value) {
+            if Type::Real.accepts(&value) {
+                return Err(
+                    at.error("No coinciden los tipos, el valor a asignar debe ser un entero.")
+                );
             }
-        } else {
-            let previous = if let Some(index) = &self.index {
-                slot.array
-                    .as_ref()
-                    .and_then(|array| array.values.get(index))
-            } else {
-                Some(&slot.scalar)
-            };
-            if let Some(ty) = value.ty()
-                && previous.is_some_and(|previous| {
-                    matches!(previous, Value::Input(_)) && !ty.accepts(previous)
-                })
-            {
-                return Err(at.error("No coinciden los tipos."));
-            }
-            slot.ty = value.ty();
+            return Err(at.error("No coinciden los tipos."));
         }
+        slot.constrain(value.possible_types(), at)?;
         slot.used = true;
         if let Some(index) = &self.index {
             slot.array
@@ -215,7 +212,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                                 .1
                                 .error(format!("La variable ({}) ya estaba definida.", name.0)));
                         }
-                        slot.ty = Some(*ty);
+                        slot.types = TypeSet::of(*ty);
+                        slot.integer = *ty == Type::Integer;
                         slot.declared = true;
                     }
                 }
@@ -565,7 +563,15 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 decimal(line).map(Value::Number).ok_or_else(bad_type)
             }
             Some(Type::Text) => Ok(Value::Text(text.to_owned())),
-            None => Ok(Value::Input(text.to_owned())),
+            None => {
+                let possible = match text {
+                    "" => TypeSet::ANY,
+                    "VERDADERO" | "FALSO" => TypeSet::TEXT_OR_LOGIC,
+                    text if decimal(text).is_some() => TypeSet::TEXT_OR_NUMBER,
+                    _ => TypeSet::TEXT,
+                };
+                Ok(Value::Input(text.to_owned(), possible))
+            }
         }
     }
 
@@ -583,24 +589,27 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
     }
 
     fn constrain_expression(
-        &self,
+        &mut self,
         frame: &mut Frame<'a>,
         expr: &Expr<'a>,
         ty: Type,
     ) -> Result<(), Diagnostic> {
-        match &expr.0 {
-            Expression::Variable(place) if !self.is_callable(place.0.0) => {
-                Self::slot(frame, place.0).constrain(ty, expr.1)
+        self.nested(expr.1, |runtime| match &expr.0 {
+            Expression::Variable(place) if !runtime.is_callable(place.0.0) => {
+                Self::slot(frame, place.0)
+                    .slot
+                    .borrow_mut()
+                    .constrain(TypeSet::of(ty), expr.1)
             }
             Expression::Unary(Op::Plus | Op::Minus, operand) => {
-                self.constrain_expression(frame, operand, ty)
+                runtime.constrain_expression(frame, operand, ty)
             }
             Expression::Binary(Op::Plus, left, right) => {
-                self.constrain_expression(frame, left, ty)?;
-                self.constrain_expression(frame, right, ty)
+                runtime.constrain_expression(frame, left, ty)?;
+                runtime.constrain_expression(frame, right, ty)
             }
             _ => Ok(()),
-        }
+        })
     }
 
     fn evaluate_as(
@@ -652,13 +661,16 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                     _ => unreachable!("invalid unary operator"),
                 }
             }
-            Expression::Binary(Op::And, left, right) => {
+            Expression::Binary(op @ (Op::And | Op::Or), left, right) => {
+                self.constrain_expression(frame, left, Type::Logic)?;
                 self.constrain_expression(frame, right, Type::Logic)?;
-                Value::Logic(self.condition(frame, left)? && self.condition(frame, right)?)
-            }
-            Expression::Binary(Op::Or, left, right) => {
-                self.constrain_expression(frame, right, Type::Logic)?;
-                Value::Logic(self.condition(frame, left)? || self.condition(frame, right)?)
+                let left_value = self.evaluate(frame, left)?.as_bool(left.1)?;
+                let value = if left_value == (*op == Op::Or) {
+                    left_value
+                } else {
+                    self.evaluate(frame, right)?.as_bool(right.1)?
+                };
+                Value::Logic(value)
             }
             Expression::Binary(op, left, right) => {
                 self.evaluate_binary(frame, *op, left, right, *at)?
@@ -738,6 +750,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                         .error("No puede utilizar una expresión en un pasaje por referencia.")
                 })?;
                 self.address(frame, reference, true)?
+            } else if let Some(place) = place {
+                self.address(frame, place, false)?.copy(arg.1)?
             } else {
                 let value = self.evaluate(frame, arg)?;
                 Address::new(value.ty(), value)
@@ -774,40 +788,42 @@ impl Type {
     }
 
     fn accepts(self, value: &Value) -> bool {
-        match (self, value) {
-            (Self::Integer, Value::Number(n)) => {
-                n.fract() == 0.0 && (*n >= f64::from(i32::MIN) && *n <= f64::from(i32::MAX))
-            }
-            (Self::Real, Value::Number(_))
-            | (Self::Logic, Value::Logic(_))
-            | (Self::Text, Value::Text(_))
-            | (_, Value::Empty) => true,
-            (Self::Integer, Value::Input(text)) => !text.contains('.') && decimal(text).is_some(),
-            (Self::Real, Value::Input(text)) => decimal(text).is_some(),
-            (Self::Logic, Value::Input(text)) => {
-                matches!(text.as_str(), "VERDADERO" | "FALSO" | "")
-            }
-            (Self::Text, Value::Input(_)) => true,
-            _ => false,
+        if !value.allows(self) {
+            return false;
         }
+        if self == Self::Integer && !matches!(value, Value::Empty) {
+            let number = match value {
+                Value::Number(n) => Some(*n),
+                Value::Input(text, _) => decimal(text),
+                _ => None,
+            };
+            return number.is_some_and(|n| {
+                n.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&n)
+            });
+        }
+        true
     }
 }
 
 impl Value {
-    fn ty(&self) -> Option<Type> {
+    fn possible_types(&self) -> TypeSet {
         match self {
-            Self::Number(_) => Some(Type::Real),
-            Self::Logic(_) => Some(Type::Logic),
-            Self::Text(_) => Some(Type::Text),
-            Self::Input(text)
-                if !text.is_empty()
-                    && decimal(text).is_none()
-                    && !matches!(text.as_str(), "VERDADERO" | "FALSO") =>
-            {
-                Some(Type::Text)
-            }
-            Self::Empty | Self::Input(_) => None,
+            Self::Number(_) => TypeSet::NUMBER,
+            Self::Logic(_) => TypeSet::LOGIC,
+            Self::Text(_) => TypeSet::TEXT,
+            Self::Input(_, types) => *types,
+            Self::Empty => TypeSet::ANY,
         }
+    }
+
+    fn allows(&self, ty: Type) -> bool {
+        self.possible_types()
+            .intersection(TypeSet::of(ty))
+            .is_some()
+    }
+
+    fn ty(&self) -> Option<Type> {
+        self.possible_types().known()
     }
 
     fn display(&self) -> String {
@@ -815,7 +831,7 @@ impl Value {
             Self::Number(value) => display_number(*value),
             Self::Logic(true) => String::from("VERDADERO"),
             Self::Logic(false) => String::from("FALSO"),
-            Self::Text(text) | Self::Input(text) => text.clone(),
+            Self::Text(text) | Self::Input(text, _) => text.clone(),
             Self::Empty => String::new(),
         }
     }
@@ -823,9 +839,7 @@ impl Value {
     pub(crate) fn as_bool(&self, at: Position) -> Result<bool, Diagnostic> {
         match self {
             Self::Logic(value) => Ok(*value),
-            Self::Input(text) if matches!(text.as_str(), "VERDADERO" | "FALSO" | "") => {
-                Ok(text == "VERDADERO")
-            }
+            Self::Input(text, _) if self.allows(Type::Logic) => Ok(text == "VERDADERO"),
             Self::Empty => Ok(false),
             _ => Err(at.error("Se esperaba un valor lógico.")),
         }
@@ -834,7 +848,7 @@ impl Value {
     pub(crate) fn as_number(&self, at: Position) -> Result<f64, Diagnostic> {
         match self {
             Self::Number(value) => Ok(*value),
-            Self::Input(text) => {
+            Self::Input(text, _) if self.allows(Type::Real) => {
                 decimal(text).ok_or_else(|| at.error("Se esperaba un valor numérico."))
             }
             Self::Empty => Ok(0.0),
@@ -844,7 +858,8 @@ impl Value {
 
     pub(crate) fn as_text(&self, at: Position) -> Result<&str, Diagnostic> {
         match self {
-            Self::Text(value) | Self::Input(value) => Ok(value),
+            Self::Text(value) => Ok(value),
+            Self::Input(value, _) if self.allows(Type::Text) => Ok(value),
             Self::Empty => Ok(""),
             _ => Err(at.error("Se esperaba una cadena de caracteres.")),
         }
@@ -870,7 +885,7 @@ fn binary(op: Op, left: Value, right: Value, at: Position) -> Result<Value, Diag
         }),
     };
     let typed = |value: Value| match value {
-        Empty | Input(_) => match ty {
+        Empty | Input(..) => match ty {
             Type::Real | Type::Integer => value.as_number(at).map(Number),
             Type::Logic => value.as_bool(at).map(Logic),
             Type::Text => value.as_text(at).map(|text| Text(text.to_owned())),
