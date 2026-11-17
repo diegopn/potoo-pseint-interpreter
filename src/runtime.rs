@@ -618,14 +618,59 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         })
     }
 
+    fn apply_expected_type(
+        &mut self,
+        frame: &mut Frame<'a>,
+        expr: &Expr<'a>,
+        allowed: TypeSet,
+    ) -> Result<(), Diagnostic> {
+        self.nested(expr.1, |runtime| {
+            if runtime
+                .determine_types(frame, expr)?
+                .intersection(allowed)
+                .is_none()
+            {
+                return Err(expr.1.error("No coinciden los tipos."));
+            }
+            use Op::*;
+            match &expr.0 {
+                Expression::Unary(Plus | Minus, operand) => {
+                    runtime.apply_type_if_needed(frame, operand, allowed)
+                }
+                Expression::Binary(
+                    Plus | Minus | Times | Divide | Power | Mod | And | Or,
+                    left,
+                    right,
+                ) => {
+                    runtime.apply_type_if_needed(frame, left, allowed)?;
+                    runtime.apply_type_if_needed(frame, right, allowed)
+                }
+                _ => runtime.constrain_expression(frame, expr, allowed),
+            }
+        })
+    }
+
+    fn apply_type_if_needed(
+        &mut self,
+        frame: &mut Frame<'a>,
+        expr: &Expr<'a>,
+        allowed: TypeSet,
+    ) -> Result<(), Diagnostic> {
+        if self.determine_types(frame, expr)? != allowed {
+            self.apply_expected_type(frame, expr, allowed)?;
+        }
+        Ok(())
+    }
+
     fn evaluate_as(
         &mut self,
         frame: &mut Frame<'a>,
         expr: &Expr<'a>,
         ty: Type,
     ) -> Result<Value, Diagnostic> {
-        self.constrain_expression(frame, expr, TypeSet::of(ty))?;
-        self.evaluate(frame, expr)
+        let allowed = TypeSet::of(ty);
+        self.apply_expected_type(frame, expr, allowed)?;
+        self.evaluate_operand(frame, expr, allowed)
     }
 
     fn evaluate(&mut self, frame: &mut Frame<'a>, expr: &Expr<'a>) -> Result<Value, Diagnostic> {
@@ -654,12 +699,20 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 Value::Logic((left - f64::from(builtins::trunc(right))).abs() < 1e-11)
             }
             Expression::Unary(op, operand) => {
-                let expected = if *op == Op::Not {
-                    Type::Logic
+                let allowed = if *op == Op::Not {
+                    TypeSet::LOGIC
                 } else {
-                    Type::Real
+                    TypeSet::NUMBER
                 };
-                let value = self.evaluate_as(frame, operand, expected)?;
+                let candidates = self.determine_types(frame, operand)?;
+                if candidates == TypeSet::EMPTY {
+                    self.evaluate(frame, operand)?;
+                    return Err(at.error("No coinciden los tipos."));
+                }
+                if candidates != allowed {
+                    self.apply_expected_type(frame, operand, allowed)?;
+                }
+                let value = self.evaluate_operand(frame, operand, allowed)?;
                 match op {
                     Op::Not => Value::Logic(!value.as_bool(*at)?),
                     Op::Plus => Value::Number(value.as_number(*at)?),
@@ -668,13 +721,23 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 }
             }
             Expression::Binary(op @ (Op::And | Op::Or), left, right) => {
-                self.constrain_expression(frame, left, TypeSet::LOGIC)?;
-                self.constrain_expression(frame, right, TypeSet::LOGIC)?;
-                let left_value = self.evaluate(frame, left)?.as_bool(left.1)?;
+                let (left_types, right_types) =
+                    self.operator_operand_types(frame, left, right, *at)?;
+                let allowed = TypeSet::LOGIC;
+                if left_types != allowed {
+                    self.apply_expected_type(frame, left, allowed)?;
+                }
+                if right_types != allowed {
+                    self.apply_expected_type(frame, right, allowed)?;
+                }
+                let left_value = self
+                    .evaluate_operand(frame, left, allowed)?
+                    .as_bool(left.1)?;
                 let value = if left_value == (*op == Op::Or) {
                     left_value
                 } else {
-                    self.evaluate(frame, right)?.as_bool(right.1)?
+                    self.evaluate_operand(frame, right, allowed)?
+                        .as_bool(right.1)?
                 };
                 Value::Logic(value)
             }
@@ -731,7 +794,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         Ok(addition_types(left, right).unwrap_or(TypeSet::EMPTY))
     }
 
-    fn evaluate_addend(
+    fn evaluate_operand(
         &mut self,
         frame: &mut Frame<'a>,
         expr: &Expr<'a>,
@@ -747,6 +810,24 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         Ok(value)
     }
 
+    fn operator_operand_types(
+        &mut self,
+        frame: &mut Frame<'a>,
+        left: &Expr<'a>,
+        right: &Expr<'a>,
+        at: Position,
+    ) -> Result<(TypeSet, TypeSet), Diagnostic> {
+        let left_types = self.determine_types(frame, left)?;
+        let right_types = self.determine_types(frame, right)?;
+        if left_types == TypeSet::EMPTY || right_types == TypeSet::EMPTY {
+            // Let the invalid operand report its error after the preceding operand has run.
+            self.evaluate(frame, left)?;
+            self.evaluate(frame, right)?;
+            return Err(at.error("No coinciden los tipos."));
+        }
+        Ok((left_types, right_types))
+    }
+
     fn evaluate_sum(
         &mut self,
         frame: &mut Frame<'a>,
@@ -754,14 +835,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         right: &Expr<'a>,
         at: Position,
     ) -> Result<Value, Diagnostic> {
-        let left_types = self.determine_types(frame, left)?;
-        let right_types = self.determine_types(frame, right)?;
-        if left_types == TypeSet::EMPTY || right_types == TypeSet::EMPTY {
-            // Evaluation reaches the invalid operand in source order and reports its own error.
-            self.evaluate(frame, left)?;
-            self.evaluate(frame, right)?;
-            return Err(addition_type_error(at));
-        }
+        let (left_types, right_types) = self.operator_operand_types(frame, left, right, at)?;
         let allowed =
             addition_types(left_types, right_types).ok_or_else(|| addition_type_error(at))?;
         if left_types != allowed {
@@ -771,8 +845,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
             self.constrain_expression(frame, right, allowed)?;
         }
 
-        let left = self.evaluate_addend(frame, left, allowed)?;
-        let right = self.evaluate_addend(frame, right, allowed)?;
+        let left = self.evaluate_operand(frame, left, allowed)?;
+        let right = self.evaluate_operand(frame, right, allowed)?;
         if left
             .possible_types()
             .intersection(right.possible_types())
@@ -801,9 +875,18 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         right: &Expr<'a>,
         at: Position,
     ) -> Result<Value, Diagnostic> {
+        let (left_types, right_types) = self.operator_operand_types(frame, left, right, at)?;
         if matches!(op, Op::Minus | Op::Times | Op::Divide | Op::Power | Op::Mod) {
-            self.constrain_expression(frame, left, TypeSet::NUMBER)?;
-            self.constrain_expression(frame, right, TypeSet::NUMBER)?;
+            let allowed = TypeSet::NUMBER;
+            if left_types != allowed {
+                self.apply_expected_type(frame, left, allowed)?;
+            }
+            if right_types != allowed {
+                self.apply_expected_type(frame, right, allowed)?;
+            }
+            let left = self.evaluate_operand(frame, left, allowed)?;
+            let right = self.evaluate_operand(frame, right, allowed)?;
+            return binary(op, left, right, at);
         }
         let left_value = self.evaluate(frame, left)?;
         let right_value = self.evaluate(frame, right)?;
