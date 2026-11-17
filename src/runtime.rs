@@ -21,6 +21,7 @@ pub(crate) fn execute<'a>(
     let random = Random::new(host.random_seed());
     let mut runtime = Runtime {
         program,
+        return_types: &types.returns,
         input,
         output,
         host,
@@ -30,7 +31,7 @@ pub(crate) fn execute<'a>(
         call_depth: 0,
         nesting: 0,
     };
-    runtime.block(&mut seed_frame(types), &program.main.body)
+    runtime.block(&mut seed_frame(&types.main), &program.main.body)
 }
 
 type Frame<'a> = HashMap<&'a str, Address>;
@@ -161,43 +162,9 @@ fn seed_frame<'a>(types: &HashMap<&'a str, Type>) -> Frame<'a> {
         .collect()
 }
 
-enum Addend {
-    Value(Value),
-    NumberOrText(f64, String),
-}
-
-impl Addend {
-    fn possible_types(&self) -> TypeSet {
-        match self {
-            Self::Value(value) => value.possible_types(),
-            Self::NumberOrText(..) => TypeSet::TEXT_OR_NUMBER,
-        }
-    }
-
-    fn as_number(&self, at: Position) -> Result<f64, Diagnostic> {
-        match self {
-            Self::Value(value) => value.as_number(at),
-            Self::NumberOrText(number, _) => Ok(*number),
-        }
-    }
-
-    fn as_text(&self, at: Position) -> Result<&str, Diagnostic> {
-        match self {
-            Self::Value(value) => value.as_text(at),
-            Self::NumberOrText(_, text) => Ok(text),
-        }
-    }
-
-    fn into_value(self) -> Value {
-        match self {
-            Self::Value(value) => value,
-            Self::NumberOrText(number, _) => Value::Number(number),
-        }
-    }
-}
-
 struct Runtime<'a, 'run, R, W, H> {
     program: &'run Program<'a>,
+    return_types: &'run HashMap<&'a str, TypeSet>,
     input: &'run mut R,
     output: &'run mut W,
     host: &'run mut H,
@@ -708,7 +675,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 Value::Logic(value)
             }
             Expression::Binary(Op::Plus, left, right) => {
-                self.evaluate_sum(frame, left, right, *at)?.into_value()
+                self.evaluate_sum(frame, left, right, *at)?
             }
             Expression::Binary(op, left, right) => {
                 self.evaluate_binary(frame, *op, left, right, *at)?
@@ -716,17 +683,51 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         })
     }
 
-    fn evaluate_addend(
+    fn determine_types(
         &mut self,
-        frame: &mut Frame<'a>,
+        frame: &Frame<'a>,
         expr: &Expr<'a>,
-    ) -> Result<Addend, Diagnostic> {
-        match &expr.0 {
-            Expression::Binary(Op::Plus, left, right) => self.nested(expr.1, |runtime| {
-                runtime.evaluate_sum(frame, left, right, expr.1)
-            }),
-            _ => self.evaluate(frame, expr).map(Addend::Value),
-        }
+    ) -> Result<TypeSet, Diagnostic> {
+        self.nested(expr.1, |runtime| {
+            use Op::*;
+            Ok(match &expr.0 {
+                Expression::Literal(value) => value.possible_types(),
+                Expression::Variable(Place(Name(name, _), _)) => {
+                    if let Some(signature) = builtins::signature(name) {
+                        TypeSet::of(signature.result)
+                    } else if let Some(&returns) = runtime.return_types.get(name) {
+                        returns
+                    } else {
+                        frame
+                            .get(name)
+                            .map_or(TypeSet::ANY, |address| address.slot.borrow().types)
+                    }
+                }
+                Expression::Unary(Not, _)
+                | Expression::IsInteger(_)
+                | Expression::Binary(And | Or | Eq | Ne | Lt | Le | Gt | Ge, _, _) => {
+                    TypeSet::LOGIC
+                }
+                Expression::Binary(Plus, left, right) => {
+                    runtime.determine_sum_types(frame, left, right, expr.1)?
+                }
+                Expression::Unary(..) | Expression::Binary(..) => TypeSet::NUMBER,
+            })
+        })
+    }
+
+    fn determine_sum_types(
+        &mut self,
+        frame: &Frame<'a>,
+        left: &Expr<'a>,
+        right: &Expr<'a>,
+        at: Position,
+    ) -> Result<TypeSet, Diagnostic> {
+        let left = self.determine_types(frame, left)?;
+        let right = self.determine_types(frame, right)?;
+        left.intersection(right)
+            .and_then(|possible| possible.intersection(TypeSet::TEXT_OR_NUMBER))
+            .ok_or_else(|| addition_type_error(at))
     }
 
     fn evaluate_sum(
@@ -735,25 +736,33 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         left: &Expr<'a>,
         right: &Expr<'a>,
         at: Position,
-    ) -> Result<Addend, Diagnostic> {
-        let left_value = self.evaluate_addend(frame, left)?;
-        let right_value = self.evaluate_addend(frame, right)?;
-        let allowed = left_value
-            .possible_types()
-            .intersection(right_value.possible_types())
-            .and_then(|shared| shared.intersection(TypeSet::TEXT_OR_NUMBER))
-            .ok_or_else(|| {
-                at.error("No coinciden los tipos (+). Los operandos deben ser de igual tipo.")
-            })?;
+    ) -> Result<Value, Diagnostic> {
+        let allowed = self.determine_sum_types(frame, left, right, at)?;
         self.constrain_expression(frame, left, allowed)?;
         self.constrain_expression(frame, right, allowed)?;
-        let sum = || Ok(left_value.as_number(at)? + right_value.as_number(at)?);
-        let joined = || Ok([left_value.as_text(at)?, right_value.as_text(at)?].concat());
-        match allowed {
-            TypeSet::NUMBER => sum().map(|value| Addend::Value(Value::Number(value))),
-            TypeSet::TEXT => joined().map(|value| Addend::Value(Value::Text(value))),
-            // A surrounding sum can still require text before the result becomes a number.
-            _ => Ok(Addend::NumberOrText(sum()?, joined()?)),
+
+        let left = self.evaluate(frame, left)?;
+        if left.possible_types().intersection(allowed).is_none() {
+            return Err(addition_type_error(at));
+        }
+        let right = self.evaluate(frame, right)?;
+        if left
+            .possible_types()
+            .intersection(right.possible_types())
+            .and_then(|possible| possible.intersection(allowed))
+            .is_none()
+        {
+            return Err(addition_type_error(at));
+        }
+        // When both candidates remain, the reference adds numerically.
+        if allowed == TypeSet::TEXT {
+            Ok(Value::Text(
+                [left.as_text(at)?, right.as_text(at)?].concat(),
+            ))
+        } else {
+            Ok(Value::Number(
+                addition_number(&left, at)? + addition_number(&right, at)?,
+            ))
         }
     }
 
@@ -944,6 +953,45 @@ impl Value {
             _ => Err(at.error("Se esperaba una cadena de caracteres.")),
         }
     }
+}
+
+fn addition_type_error(at: Position) -> Diagnostic {
+    at.error("No coinciden los tipos (+). Los operandos deben ser de igual tipo.")
+}
+
+fn addition_number(value: &Value, at: Position) -> Result<f64, Diagnostic> {
+    let Value::Text(text) = value else {
+        return value.as_number(at);
+    };
+    // A call with an unresolved static return type can supply text after numeric addition was selected.
+    let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+    if let Ok(number) = text.parse() {
+        return Ok(number);
+    }
+    let mut end = 0;
+    let mut dot = false;
+    for (index, byte) in text.bytes().enumerate() {
+        match byte {
+            b'+' | b'-' if index == 0 => {}
+            b'0'..=b'9' => {}
+            b'.' if !dot => dot = true,
+            b'e' | b'E' => {
+                let exponent = &text[index + 1..];
+                let sign = usize::from(exponent.starts_with(['+', '-']));
+                let digits = exponent[sign..]
+                    .bytes()
+                    .take_while(u8::is_ascii_digit)
+                    .count();
+                if digits > 0 {
+                    end = index + 1 + sign + digits;
+                }
+                break;
+            }
+            _ => break,
+        }
+        end = index + 1;
+    }
+    Ok(text[..end].parse().unwrap_or(0.0))
 }
 
 fn binary(op: Op, left: Value, right: Value, at: Position) -> Result<Value, Diagnostic> {

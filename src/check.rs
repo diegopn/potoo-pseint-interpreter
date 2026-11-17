@@ -2,16 +2,20 @@ use std::collections::{HashMap, HashSet};
 
 use crate::builtins;
 use crate::parser::{
-    Expr, Expression, Line, Name, Op, Passage, Place, Program, Routine, Statement, Type, Value,
+    Expr, Expression, Line, Name, Op, Passage, Place, Program, Routine, Statement, Type, TypeSet,
+    Value,
 };
 use crate::{Diagnostic, Position};
 
-pub(crate) type Types<'a> = HashMap<&'a str, Type>;
+pub(crate) struct Types<'a> {
+    pub main: HashMap<&'a str, Type>,
+    pub returns: HashMap<&'a str, TypeSet>,
+}
 
-const NUMERIC: u8 = 1;
-const TEXT: u8 = 2;
-const LOGIC: u8 = 4;
-const ALL: u8 = NUMERIC | TEXT | LOGIC;
+const NUMERIC: u8 = TypeSet::NUMBER.bits();
+const TEXT: u8 = TypeSet::TEXT.bits();
+const LOGIC: u8 = TypeSet::LOGIC.bits();
+const ALL: u8 = TypeSet::ANY.bits();
 
 type Variable = usize;
 type TypeFlow = (Variable, Variable, Position);
@@ -168,6 +172,14 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
             ty.map(|ty| (name, ty))
         })
         .collect();
+    let returns = checker
+        .returns
+        .iter()
+        .map(|(&name, &variable)| {
+            let possible = checker.constraints.possibilities(variable);
+            (name, TypeSet::from_bits(possible))
+        })
+        .collect();
     checker.flows.extend(
         checker
             .arguments
@@ -180,7 +192,10 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
             return Err(at.error("El subíndice debe ser numérico."));
         }
     }
-    Ok(main_types)
+    Ok(Types {
+        main: main_types,
+        returns,
+    })
 }
 
 impl<'a> Checker<'a, '_> {

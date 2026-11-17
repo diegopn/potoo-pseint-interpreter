@@ -20,6 +20,14 @@ impl TypeSet {
     pub const TEXT_OR_NUMBER: Self = Self(Self::TEXT.0 | Self::NUMBER.0);
     pub const TEXT_OR_LOGIC: Self = Self(Self::TEXT.0 | Self::LOGIC.0);
 
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits)
+    }
+
     pub fn of(ty: Type) -> Self {
         match ty {
             Type::Integer | Type::Real => Self::NUMBER,
