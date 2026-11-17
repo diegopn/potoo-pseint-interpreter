@@ -607,6 +607,10 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 runtime.constrain_expression(frame, operand, allowed)
             }
             Expression::Binary(Op::Plus, left, right) => {
+                let current = runtime.determine_sum_types(frame, left, right, expr.1)?;
+                if current.intersection(allowed) == Some(current) {
+                    return Ok(());
+                }
                 runtime.constrain_expression(frame, left, allowed)?;
                 runtime.constrain_expression(frame, right, allowed)
             }
@@ -725,9 +729,23 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
     ) -> Result<TypeSet, Diagnostic> {
         let left = self.determine_types(frame, left)?;
         let right = self.determine_types(frame, right)?;
-        left.intersection(right)
-            .and_then(|possible| possible.intersection(TypeSet::TEXT_OR_NUMBER))
-            .ok_or_else(|| addition_type_error(at))
+        addition_types(left, right, at)
+    }
+
+    fn evaluate_addend(
+        &mut self,
+        frame: &mut Frame<'a>,
+        expr: &Expr<'a>,
+        allowed: TypeSet,
+    ) -> Result<Value, Diagnostic> {
+        let value = self.evaluate(frame, expr)?;
+        if let Expression::Variable(Place(Name(name, _), _)) = &expr.0
+            && self.is_callable(name)
+            && value.possible_types().intersection(allowed).is_none()
+        {
+            return Err(expr.1.error("No coinciden los tipos."));
+        }
+        Ok(value)
     }
 
     fn evaluate_sum(
@@ -737,15 +755,18 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         right: &Expr<'a>,
         at: Position,
     ) -> Result<Value, Diagnostic> {
-        let allowed = self.determine_sum_types(frame, left, right, at)?;
-        self.constrain_expression(frame, left, allowed)?;
-        self.constrain_expression(frame, right, allowed)?;
-
-        let left = self.evaluate(frame, left)?;
-        if left.possible_types().intersection(allowed).is_none() {
-            return Err(addition_type_error(at));
+        let left_types = self.determine_types(frame, left)?;
+        let right_types = self.determine_types(frame, right)?;
+        let allowed = addition_types(left_types, right_types, at)?;
+        if left_types != allowed {
+            self.constrain_expression(frame, left, allowed)?;
         }
-        let right = self.evaluate(frame, right)?;
+        if right_types != allowed {
+            self.constrain_expression(frame, right, allowed)?;
+        }
+
+        let left = self.evaluate_addend(frame, left, allowed)?;
+        let right = self.evaluate_addend(frame, right, allowed)?;
         if left
             .possible_types()
             .intersection(right.possible_types())
@@ -955,15 +976,22 @@ impl Value {
     }
 }
 
+fn addition_types(left: TypeSet, right: TypeSet, at: Position) -> Result<TypeSet, Diagnostic> {
+    left.intersection(right)
+        .and_then(|possible| possible.intersection(TypeSet::TEXT_OR_NUMBER))
+        .ok_or_else(|| addition_type_error(at))
+}
+
 fn addition_type_error(at: Position) -> Diagnostic {
     at.error("No coinciden los tipos (+). Los operandos deben ser de igual tipo.")
 }
 
 fn addition_number(value: &Value, at: Position) -> Result<f64, Diagnostic> {
-    let Value::Text(text) = value else {
-        return value.as_number(at);
+    let text = match value {
+        Value::Text(text) | Value::Input(text, _) => text,
+        _ => return value.as_number(at),
     };
-    // A call with an unresolved static return type can supply text after numeric addition was selected.
+    // Numeric addition uses numeric string conversion after choosing a compatible operand type.
     let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
     if let Ok(number) = text.parse() {
         return Ok(number);
