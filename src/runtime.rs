@@ -624,30 +624,28 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         expr: &Expr<'a>,
         allowed: TypeSet,
     ) -> Result<(), Diagnostic> {
-        self.nested(expr.1, |runtime| {
-            if runtime
-                .determine_types(frame, expr)?
-                .intersection(allowed)
-                .is_none()
-            {
-                return Err(expr.1.error("No coinciden los tipos."));
-            }
-            use Op::*;
-            match &expr.0 {
-                Expression::Unary(Plus | Minus, operand) => {
-                    runtime.apply_type_if_needed(frame, operand, allowed)
-                }
-                Expression::Binary(
-                    Plus | Minus | Times | Divide | Power | Mod | And | Or,
-                    left,
-                    right,
-                ) => {
-                    runtime.apply_type_if_needed(frame, left, allowed)?;
-                    runtime.apply_type_if_needed(frame, right, allowed)
-                }
-                _ => runtime.constrain_expression(frame, expr, allowed),
-            }
-        })
+        if self
+            .determine_types(frame, expr)?
+            .intersection(allowed)
+            .is_none()
+        {
+            return Err(expr.1.error("No coinciden los tipos."));
+        }
+        use Op::*;
+        match &expr.0 {
+            Expression::Unary(Plus | Minus, operand) => self.nested(expr.1, |runtime| {
+                runtime.apply_type_if_needed(frame, operand, allowed)
+            }),
+            Expression::Binary(
+                Plus | Minus | Times | Divide | Power | Mod | And | Or,
+                left,
+                right,
+            ) => self.nested(expr.1, |runtime| {
+                runtime.apply_type_if_needed(frame, left, allowed)?;
+                runtime.apply_type_if_needed(frame, right, allowed)
+            }),
+            _ => self.constrain_expression(frame, expr, allowed),
+        }
     }
 
     fn apply_type_if_needed(
