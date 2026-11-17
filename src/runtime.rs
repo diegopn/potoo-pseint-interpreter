@@ -161,6 +161,41 @@ fn seed_frame<'a>(types: &HashMap<&'a str, Type>) -> Frame<'a> {
         .collect()
 }
 
+enum Addend {
+    Value(Value),
+    NumberOrText(f64, String),
+}
+
+impl Addend {
+    fn possible_types(&self) -> TypeSet {
+        match self {
+            Self::Value(value) => value.possible_types(),
+            Self::NumberOrText(..) => TypeSet::TEXT_OR_NUMBER,
+        }
+    }
+
+    fn as_number(&self, at: Position) -> Result<f64, Diagnostic> {
+        match self {
+            Self::Value(value) => value.as_number(at),
+            Self::NumberOrText(number, _) => Ok(*number),
+        }
+    }
+
+    fn as_text(&self, at: Position) -> Result<&str, Diagnostic> {
+        match self {
+            Self::Value(value) => value.as_text(at),
+            Self::NumberOrText(_, text) => Ok(text),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::Value(value) => value,
+            Self::NumberOrText(number, _) => Value::Number(number),
+        }
+    }
+}
+
 struct Runtime<'a, 'run, R, W, H> {
     program: &'run Program<'a>,
     input: &'run mut R,
@@ -592,21 +627,21 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         &mut self,
         frame: &mut Frame<'a>,
         expr: &Expr<'a>,
-        ty: Type,
+        allowed: TypeSet,
     ) -> Result<(), Diagnostic> {
         self.nested(expr.1, |runtime| match &expr.0 {
             Expression::Variable(place) if !runtime.is_callable(place.0.0) => {
                 Self::slot(frame, place.0)
                     .slot
                     .borrow_mut()
-                    .constrain(TypeSet::of(ty), expr.1)
+                    .constrain(allowed, expr.1)
             }
             Expression::Unary(Op::Plus | Op::Minus, operand) => {
-                runtime.constrain_expression(frame, operand, ty)
+                runtime.constrain_expression(frame, operand, allowed)
             }
             Expression::Binary(Op::Plus, left, right) => {
-                runtime.constrain_expression(frame, left, ty)?;
-                runtime.constrain_expression(frame, right, ty)
+                runtime.constrain_expression(frame, left, allowed)?;
+                runtime.constrain_expression(frame, right, allowed)
             }
             _ => Ok(()),
         })
@@ -618,7 +653,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         expr: &Expr<'a>,
         ty: Type,
     ) -> Result<Value, Diagnostic> {
-        self.constrain_expression(frame, expr, ty)?;
+        self.constrain_expression(frame, expr, TypeSet::of(ty))?;
         self.evaluate(frame, expr)
     }
 
@@ -662,8 +697,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 }
             }
             Expression::Binary(op @ (Op::And | Op::Or), left, right) => {
-                self.constrain_expression(frame, left, Type::Logic)?;
-                self.constrain_expression(frame, right, Type::Logic)?;
+                self.constrain_expression(frame, left, TypeSet::LOGIC)?;
+                self.constrain_expression(frame, right, TypeSet::LOGIC)?;
                 let left_value = self.evaluate(frame, left)?.as_bool(left.1)?;
                 let value = if left_value == (*op == Op::Or) {
                     left_value
@@ -672,10 +707,54 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 };
                 Value::Logic(value)
             }
+            Expression::Binary(Op::Plus, left, right) => {
+                self.evaluate_sum(frame, left, right, *at)?.into_value()
+            }
             Expression::Binary(op, left, right) => {
                 self.evaluate_binary(frame, *op, left, right, *at)?
             }
         })
+    }
+
+    fn evaluate_addend(
+        &mut self,
+        frame: &mut Frame<'a>,
+        expr: &Expr<'a>,
+    ) -> Result<Addend, Diagnostic> {
+        match &expr.0 {
+            Expression::Binary(Op::Plus, left, right) => self.nested(expr.1, |runtime| {
+                runtime.evaluate_sum(frame, left, right, expr.1)
+            }),
+            _ => self.evaluate(frame, expr).map(Addend::Value),
+        }
+    }
+
+    fn evaluate_sum(
+        &mut self,
+        frame: &mut Frame<'a>,
+        left: &Expr<'a>,
+        right: &Expr<'a>,
+        at: Position,
+    ) -> Result<Addend, Diagnostic> {
+        let left_value = self.evaluate_addend(frame, left)?;
+        let right_value = self.evaluate_addend(frame, right)?;
+        let allowed = left_value
+            .possible_types()
+            .intersection(right_value.possible_types())
+            .and_then(|shared| shared.intersection(TypeSet::TEXT_OR_NUMBER))
+            .ok_or_else(|| {
+                at.error("No coinciden los tipos (+). Los operandos deben ser de igual tipo.")
+            })?;
+        self.constrain_expression(frame, left, allowed)?;
+        self.constrain_expression(frame, right, allowed)?;
+        let sum = || Ok(left_value.as_number(at)? + right_value.as_number(at)?);
+        let joined = || Ok([left_value.as_text(at)?, right_value.as_text(at)?].concat());
+        match allowed {
+            TypeSet::NUMBER => sum().map(|value| Addend::Value(Value::Number(value))),
+            TypeSet::TEXT => joined().map(|value| Addend::Value(Value::Text(value))),
+            // A surrounding sum can still require text before the result becomes a number.
+            _ => Ok(Addend::NumberOrText(sum()?, joined()?)),
+        }
     }
 
     fn evaluate_binary(
@@ -687,14 +766,15 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         at: Position,
     ) -> Result<Value, Diagnostic> {
         if matches!(op, Op::Minus | Op::Times | Op::Divide | Op::Power | Op::Mod) {
-            self.constrain_expression(frame, left, Type::Real)?;
-            self.constrain_expression(frame, right, Type::Real)?;
+            self.constrain_expression(frame, left, TypeSet::NUMBER)?;
+            self.constrain_expression(frame, right, TypeSet::NUMBER)?;
         }
         let left_value = self.evaluate(frame, left)?;
         let right_value = self.evaluate(frame, right)?;
         if let Some(ty) = left_value.ty().or_else(|| right_value.ty()) {
-            self.constrain_expression(frame, left, ty)?;
-            self.constrain_expression(frame, right, ty)?;
+            let allowed = TypeSet::of(ty);
+            self.constrain_expression(frame, left, allowed)?;
+            self.constrain_expression(frame, right, allowed)?;
         }
         binary(op, left_value, right_value, at)
     }
@@ -904,7 +984,6 @@ fn binary(op: Op, left: Value, right: Value, at: Position) -> Result<Value, Diag
                 Le => return Ok(Logic(left - epsilon <= right)),
                 Gt => return Ok(Logic(left - epsilon > right)),
                 Ge => return Ok(Logic(left + epsilon >= right)),
-                Plus => left + right,
                 Minus => left - right,
                 Times => left * right,
                 Divide if right == 0.0 => return Err(at.error("División por cero.")),
@@ -926,7 +1005,6 @@ fn binary(op: Op, left: Value, right: Value, at: Position) -> Result<Value, Diag
             Ok(Number(result))
         }
         (Text(left), Text(right)) => Ok(match op {
-            Plus => Text(left + &right),
             Eq => Logic(left == right),
             Ne => Logic(left != right),
             Lt => Logic(left < right),
