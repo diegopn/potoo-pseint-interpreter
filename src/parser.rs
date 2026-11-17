@@ -1,5 +1,5 @@
 use crate::lexer::{Kind, Token};
-use crate::{Diagnostic, Position};
+use crate::{Diagnostic, MAX_NESTING, Position};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Type {
@@ -41,7 +41,24 @@ pub(crate) enum Op {
 pub(crate) struct Name<'a>(pub &'a str, pub Position);
 
 #[derive(Clone)]
-pub(crate) struct Expr<'a>(pub Expression<'a>, pub Position);
+pub(crate) struct Expr<'a>(pub Expression<'a>, pub Position, pub(crate) usize);
+
+impl<'a> Expr<'a> {
+    fn new(kind: Expression<'a>, at: Position) -> Result<Self, Diagnostic> {
+        let child_depth = match &kind {
+            Expression::Literal(_) | Expression::Variable(Place(_, None)) => 0,
+            Expression::Variable(Place(_, Some(args))) => {
+                args.iter().map(|arg| arg.2).max().unwrap_or(0)
+            }
+            Expression::Unary(_, expr) | Expression::IsInteger(expr) => expr.2,
+            Expression::Binary(_, left, right) => left.2.max(right.2),
+        };
+        if child_depth >= MAX_NESTING {
+            return Err(at.error("La expresión supera el límite de anidamiento."));
+        }
+        Ok(Self(kind, at, child_depth + 1))
+    }
+}
 
 #[derive(Clone)]
 pub(crate) enum Expression<'a> {
@@ -106,7 +123,11 @@ const MAIN: &[&str] = &["PROCESO", "ALGORITMO"];
 const SUBPROGRAM: &[&str] = &["SUBPROCESO", "SUBALGORITMO", "FUNCION", "FUNCIÓN"];
 
 pub(crate) fn parse(tokens: &[Token]) -> Result<Program<'_>, Diagnostic> {
-    let mut p = Parser { tokens, index: 0 };
+    let mut p = Parser {
+        tokens,
+        index: 0,
+        nesting: 0,
+    };
     let mut main = None;
     let mut routines = Vec::new();
     p.skip_ends();
@@ -144,9 +165,17 @@ enum Stop {
     Case,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExprContext {
+    Plain,
+    CaseLabel,
+    Output,
+}
+
 struct Parser<'a> {
     tokens: &'a [Token],
     index: usize,
+    nesting: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -351,7 +380,24 @@ impl<'a> Parser<'a> {
             .all(|(i, word)| self.word_at(self.index + i, word))
     }
 
+    fn nested<T>(
+        &mut self,
+        parse: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        if self.nesting >= MAX_NESTING {
+            return Err(self.error("Se superó el límite de anidamiento del código."));
+        }
+        self.nesting += 1;
+        let result = parse(self);
+        self.nesting -= 1;
+        result
+    }
+
     fn block(&mut self, endings: &[&str], stop: Stop) -> Result<Vec<Line<'a>>, Diagnostic> {
+        self.nested(|parser| parser.block_inner(endings, stop))
+    }
+
+    fn block_inner(&mut self, endings: &[&str], stop: Stop) -> Result<Vec<Line<'a>>, Diagnostic> {
         let mut body = Vec::new();
         while !endings.iter().any(|end| self.is_closing(end))
             && !match stop {
@@ -415,6 +461,15 @@ impl<'a> Parser<'a> {
         Ok(names)
     }
 
+    fn loop_body_start(&mut self, hacer: bool) -> Result<(), Diagnostic> {
+        if hacer {
+            self.skip_ends();
+            Ok(())
+        } else {
+            self.newline()
+        }
+    }
+
     fn for_header(&mut self, each: bool) -> Result<Statement<'a>, Diagnostic> {
         let name = self.name()?;
         if each {
@@ -422,8 +477,8 @@ impl<'a> Parser<'a> {
                 return Err(self.error("expected De or En"));
             }
             let array = self.name()?;
-            self.word("HACER");
-            self.newline()?;
+            let hacer = self.word("HACER");
+            self.loop_body_start(hacer)?;
             let body = self.block(&["PARA"], Stop::End)?;
             self.closing(&["PARA"])?;
             return Ok(Statement::ForEach(name, array, body));
@@ -440,11 +495,11 @@ impl<'a> Parser<'a> {
         };
         self.expect_word("HASTA")?;
         let last = self.expr()?;
-        self.word("HACER");
-        let step = if self.word("CON") {
-            self.expect_word("PASO")?;
+        let mut hacer = self.word("HACER");
+        let step = if self.sequence_at(&["CON", "PASO"]) {
+            self.index += 2;
             let step = self.expr()?;
-            self.word("HACER");
+            hacer |= self.word("HACER");
             if early_step.is_some() {
                 return Err(self.error("duplicate Con Paso"));
             }
@@ -452,7 +507,7 @@ impl<'a> Parser<'a> {
         } else {
             early_step
         };
-        self.newline()?;
+        self.loop_body_start(hacer)?;
         let body = self.block(&["PARA"], Stop::End)?;
         self.closing(&["PARA"])?;
         Ok(Statement::For(name, first, last, step, body))
@@ -474,9 +529,9 @@ impl<'a> Parser<'a> {
                 } else {
                     self.any_word(&["CASO", "SIES", "OPCION", "OPCIÓN"]);
                 }
-                labels.push(self.expr()?);
-                while self.take(Kind::Comma) {
-                    labels.push(self.expr()?);
+                labels.push(self.infix(0, ExprContext::CaseLabel)?);
+                while self.take(Kind::Comma) || self.take(Kind::Or) {
+                    labels.push(self.infix(0, ExprContext::CaseLabel)?);
                 }
                 self.expect(Kind::Colon, "expected ':' after case label")?;
             }
@@ -523,7 +578,7 @@ impl<'a> Parser<'a> {
             Statement::Read(targets)
         } else if self.any_word(&["ESCRIBIR", "IMPRIMIR", "MOSTRAR", "INFORMAR"]) {
             let mut newline = !self.no_newline();
-            let mut values = vec![self.expr()?];
+            let mut values = vec![self.infix(0, ExprContext::Output)?];
             loop {
                 if self.no_newline() {
                     newline = false;
@@ -534,7 +589,7 @@ impl<'a> Parser<'a> {
                 if self.no_newline() {
                     newline = false;
                 }
-                values.push(self.expr()?);
+                values.push(self.infix(0, ExprContext::Output)?);
             }
             Statement::Write(values, newline)
         } else if self.word("SI") {
@@ -555,8 +610,8 @@ impl<'a> Parser<'a> {
             Statement::If(condition, yes, no)
         } else if self.word("MIENTRAS") {
             let condition = self.expr()?;
-            self.word("HACER");
-            self.newline()?;
+            let hacer = self.word("HACER");
+            self.loop_body_start(hacer)?;
             let body = self.block(&["MIENTRAS"], Stop::End)?;
             self.closing(&["MIENTRAS"])?;
             Statement::While(condition, body)
@@ -631,9 +686,9 @@ impl<'a> Parser<'a> {
         }
         let mut arguments = Vec::new();
         if !self.take(Kind::Close) {
-            arguments.push(self.infix(0)?);
+            arguments.push(self.expr()?);
             while self.take(Kind::Comma) {
-                arguments.push(self.infix(0)?);
+                arguments.push(self.expr()?);
             }
             self.expect(Kind::Close, "expected closing parenthesis or bracket")?;
         }
@@ -663,10 +718,14 @@ impl<'a> Parser<'a> {
     }
 
     fn expr(&mut self) -> Result<Expr<'a>, Diagnostic> {
-        self.infix(0)
+        self.infix(0, ExprContext::Plain)
     }
 
-    fn infix(&mut self, min: u8) -> Result<Expr<'a>, Diagnostic> {
+    fn infix(&mut self, min: u8, context: ExprContext) -> Result<Expr<'a>, Diagnostic> {
+        self.nested(|parser| parser.infix_inner(min, context))
+    }
+
+    fn infix_inner(&mut self, min: u8, context: ExprContext) -> Result<Expr<'a>, Diagnostic> {
         let at = self.current().at;
         let expr = match &self.current().kind {
             Kind::Number(n) => {
@@ -688,11 +747,11 @@ impl<'a> Parser<'a> {
                     _ => (Op::Not, 3),
                 };
                 self.index += 1;
-                Expression::Unary(op, Box::new(self.infix(binding)?))
+                Expression::Unary(op, Box::new(self.infix(binding, context)?))
             }
             Kind::Open => {
                 self.index += 1;
-                let inner = self.infix(0)?;
+                let inner = self.expr()?;
                 if !self.take(Kind::Close) {
                     return Err(self.error("expected ')'"));
                 }
@@ -700,46 +759,54 @@ impl<'a> Parser<'a> {
             }
             Kind::Word(_) => {
                 let name = self.name()?;
-                Expression::Variable(self.place(name)?)
+                let place = if context == ExprContext::Output && self.current().spaced {
+                    Place(name, None)
+                } else {
+                    self.place(name)?
+                };
+                Expression::Variable(place)
             }
             _ => return Err(self.error("expected an expression")),
         };
-        let mut left = Expr(expr, at);
+        let mut left = Expr::new(expr, at)?;
         loop {
             if min <= 3
                 && (self.sequence_at(&["ES"])
                     || (self.current().kind == Kind::Not && self.word_at(self.index + 1, "ES")))
             {
-                left = self.colloquial(left)?;
+                left = self.colloquial(left, context)?;
                 continue;
             }
             let Some((op, precedence)) = self.operator() else {
                 break;
             };
-            if precedence < min {
+            if precedence < min
+                || (context == ExprContext::CaseLabel && self.current().kind == Kind::Or)
+            {
                 break;
             }
             let at = self.current().at;
             self.index += 1;
-            let right = self.infix(precedence + 1)?;
-            left = Expr(Expression::Binary(op, Box::new(left), Box::new(right)), at);
+            let right = self.infix(precedence + 1, context)?;
+            left = Expr::new(Expression::Binary(op, Box::new(left), Box::new(right)), at)?;
         }
         Ok(left)
     }
 
-    fn colloquial(&mut self, left: Expr<'a>) -> Result<Expr<'a>, Diagnostic> {
+    fn colloquial(&mut self, left: Expr<'a>, context: ExprContext) -> Result<Expr<'a>, Diagnostic> {
         let at = self.current().at;
         let negate = self.take(Kind::Not);
         self.expect_word("ES")?;
-        let number = |value| Expr(Expression::Literal(Value::Number(value)), at);
-        let binary =
-            |op, left, right| Expr(Expression::Binary(op, Box::new(left), Box::new(right)), at);
+        let number = |value| Expr(Expression::Literal(Value::Number(value)), at, 1);
+        let binary = |op, left, right| {
+            Expr::new(Expression::Binary(op, Box::new(left), Box::new(right)), at)
+        };
         let condition = if self.any_word(&["ENTERO", "ENTERA"]) {
-            Expr(Expression::IsInteger(Box::new(left)), at)
+            Expr::new(Expression::IsInteger(Box::new(left)), at)
         } else if self.word("PAR") {
-            binary(Op::Eq, binary(Op::Mod, left, number(2.0)), number(0.0))
+            binary(Op::Eq, binary(Op::Mod, left, number(2.0))?, number(0.0))
         } else if self.word("IMPAR") {
-            binary(Op::Eq, binary(Op::Mod, left, number(2.0)), number(1.0))
+            binary(Op::Eq, binary(Op::Mod, left, number(2.0))?, number(1.0))
         } else if self.any_word(&["POSITIVO", "POSITIVA"]) {
             binary(Op::Gt, left, number(0.0))
         } else if self.any_word(&["NEGATIVO", "NEGATIVA"]) {
@@ -750,8 +817,8 @@ impl<'a> Parser<'a> {
             if !self.any_word(&["POR", "DE"]) {
                 return Err(self.error("expected Por or De"));
             }
-            let right = self.infix(3)?;
-            binary(Op::Eq, binary(Op::Mod, left, right), number(0.0))
+            let right = self.infix(3, context)?;
+            binary(Op::Eq, binary(Op::Mod, left, right)?, number(0.0))
         } else {
             let op = if self.any_word(&["DISTINTO", "DISTINTA"]) {
                 if !self.any_word(&["A", "DE"]) {
@@ -781,19 +848,19 @@ impl<'a> Parser<'a> {
             } else {
                 Op::Eq
             };
-            let right = self.infix(3)?;
+            let right = self.infix(3, context)?;
             binary(op, left, right)
-        };
-        Ok(if negate {
-            Expr(Expression::Unary(Op::Not, Box::new(condition)), at)
+        }?;
+        if negate {
+            Expr::new(Expression::Unary(Op::Not, Box::new(condition)), at)
         } else {
-            condition
-        })
+            Ok(condition)
+        }
     }
 
     fn operator(&self) -> Option<(Op, u8)> {
         Some(match self.current().kind {
-            Kind::Or => (Op::Or, 1),
+            Kind::Or | Kind::DoubleOr => (Op::Or, 1),
             Kind::And => (Op::And, 2),
             Kind::Eq => (Op::Eq, 3),
             Kind::Ne => (Op::Ne, 4),

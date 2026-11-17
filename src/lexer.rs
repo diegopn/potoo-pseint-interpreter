@@ -20,6 +20,7 @@ pub(crate) enum Kind {
     Ge,
     And,
     Or,
+    DoubleOr,
     Not,
     Open,
     Close,
@@ -87,10 +88,8 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                     eat('&');
                     And
                 }
-                '|' => {
-                    eat('|');
-                    Or
-                }
+                '|' if eat('|') => DoubleOr,
+                '|' => Or,
                 '~' | '!' => Not,
                 '"' | '\'' => {
                     let mut value = String::new();

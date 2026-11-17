@@ -9,7 +9,7 @@ use crate::check::Types;
 use crate::parser::{
     Expr, Expression, Line, Name, Op, Passage, Place, Program, Statement, Type, Value,
 };
-use crate::{CallSite, Diagnostic, Host, Position, Step, Variable};
+use crate::{CallSite, Diagnostic, Host, MAX_NESTING, Position, Step, Variable};
 
 pub(crate) fn execute<'a>(
     program: &Program<'a>,
@@ -21,7 +21,6 @@ pub(crate) fn execute<'a>(
     let random = Random::new(host.random_seed());
     let mut runtime = Runtime {
         program,
-        types,
         input,
         output,
         host,
@@ -29,11 +28,9 @@ pub(crate) fn execute<'a>(
         line: String::new(),
         routine: program.main.name.0,
         call_depth: 0,
+        nesting: 0,
     };
-    runtime.block(
-        &mut seed_frame(&types[program.main.name.0]),
-        &program.main.body,
-    )
+    runtime.block(&mut seed_frame(types), &program.main.body)
 }
 
 type Frame<'a> = HashMap<&'a str, Address>;
@@ -48,13 +45,13 @@ struct Slot {
 
 struct Array {
     dimensions: Vec<i32>,
-    values: HashMap<Vec<i32>, Value>,
+    values: HashMap<Vec<String>, Value>,
 }
 
 #[derive(Clone)]
 struct Address {
     slot: Rc<RefCell<Slot>>,
-    index: Option<Vec<i32>>,
+    index: Option<Vec<String>>,
 }
 
 impl Address {
@@ -77,7 +74,7 @@ impl Address {
         self.slot.borrow().ty
     }
 
-    fn get(&self) -> Value {
+    fn get(&self, at: Position) -> Result<Value, Diagnostic> {
         let mut slot = self.slot.borrow_mut();
         slot.used = true;
         let value = match &self.index {
@@ -88,16 +85,27 @@ impl Address {
                 .unwrap_or(&Value::Empty),
             None => &slot.scalar,
         };
-        match value {
+        Ok(match value {
             Value::Empty => slot.ty.map_or(Value::Empty, Type::default_value),
             Value::Input(text) => match slot.ty {
-                Some(Type::Real | Type::Integer) => Value::Number(decimal(text).unwrap_or(0.0)),
-                Some(Type::Logic) => Value::Logic(text == "VERDADERO"),
+                Some(Type::Real | Type::Integer) => Value::Number(value.as_number(at)?),
+                Some(Type::Logic) => Value::Logic(value.as_bool(at)?),
                 Some(Type::Text) => Value::Text(text.clone()),
                 None => value.clone(),
             },
             value => value.clone(),
+        })
+    }
+
+    fn constrain(&self, ty: Type, at: Position) -> Result<(), Diagnostic> {
+        let mut slot = self.slot.borrow_mut();
+        match slot.ty {
+            None => slot.ty = Some(ty),
+            Some(Type::Integer) if ty == Type::Real => {}
+            Some(actual) if actual == ty => {}
+            _ => return Err(at.error("No coinciden los tipos.")),
         }
+        Ok(())
     }
 
     fn set(&self, value: Value, at: Position) -> Result<(), Diagnostic> {
@@ -158,7 +166,6 @@ fn seed_frame<'a>(types: &HashMap<&'a str, Type>) -> Frame<'a> {
 
 struct Runtime<'a, 'run, R, W, H> {
     program: &'run Program<'a>,
-    types: &'run Types<'a>,
     input: &'run mut R,
     output: &'run mut W,
     host: &'run mut H,
@@ -166,10 +173,36 @@ struct Runtime<'a, 'run, R, W, H> {
     line: String,
     routine: &'a str,
     call_depth: usize,
+    nesting: usize,
 }
 
 impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
+    fn nested<T>(
+        &mut self,
+        at: Position,
+        run: impl FnOnce(&mut Self) -> Result<T, Diagnostic>,
+    ) -> Result<T, Diagnostic> {
+        if self.nesting >= MAX_NESTING {
+            return Err(at.error("Se superó el límite de anidamiento durante la ejecución."));
+        }
+        self.nesting += 1;
+        let result = run(self);
+        self.nesting -= 1;
+        result
+    }
+
     fn block(&mut self, frame: &mut Frame<'a>, statements: &[Line<'a>]) -> Result<(), Diagnostic> {
+        let Some(first) = statements.first() else {
+            return Ok(());
+        };
+        self.nested(first.1, |runtime| runtime.block_inner(frame, statements))
+    }
+
+    fn block_inner(
+        &mut self,
+        frame: &mut Frame<'a>,
+        statements: &[Line<'a>],
+    ) -> Result<(), Diagnostic> {
         for Line(statement, at) in statements {
             self.on_line(frame, *at)?;
             match statement {
@@ -260,17 +293,23 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                     }
                 },
                 Statement::For(name, first, last, step, body) => {
-                    let start = self.evaluate(frame, first)?.as_number(first.1)?;
-                    let stop = self.evaluate(frame, last)?.as_number(last.1)?;
+                    let start = self
+                        .evaluate_as(frame, first, Type::Real)?
+                        .as_number(first.1)?;
+                    let stop = self
+                        .evaluate_as(frame, last, Type::Real)?
+                        .as_number(last.1)?;
                     let step = match step {
-                        Some(expr) => self.evaluate(frame, expr)?.as_number(expr.1)?,
+                        Some(expr) => self
+                            .evaluate_as(frame, expr, Type::Real)?
+                            .as_number(expr.1)?,
                         None if start > stop => -1.0,
                         None => 1.0,
                     };
                     let address = self.address(frame, &Place(*name, None), false)?;
                     address.store(Value::Number(start), name.1, false)?;
                     loop {
-                        let counter = address.get().as_number(name.1)?;
+                        let counter = address.get(name.1)?.as_number(name.1)?;
                         if if step >= 0.0 {
                             counter > stop
                         } else {
@@ -280,7 +319,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                         }
                         self.block(frame, body)?;
                         self.on_line(frame, *at)?;
-                        let counter = address.get().as_number(name.1)?;
+                        let counter = address.get(name.1)?.as_number(name.1)?;
                         address.store(Value::Number(counter + step), name.1, false)?;
                     }
                 }
@@ -307,11 +346,11 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                     loop {
                         let entry = Address {
                             slot: slot.clone(),
-                            index: Some(index.clone()),
+                            index: Some(index.iter().map(i32::to_string).collect()),
                         };
-                        element.set(entry.get(), name.1)?;
+                        element.set(entry.get(name.1)?, name.1)?;
                         self.block(frame, body)?;
-                        entry.set(element.get(), name.1)?;
+                        entry.set(element.get(name.1)?, name.1)?;
                         let Some(last) =
                             index.iter().zip(&bounds).rposition(|(i, bound)| i < bound)
                         else {
@@ -343,9 +382,10 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                         for label in labels {
                             self.on_line(frame, label.1)?;
                             self.evaluate(frame, label)?;
-                            let left = self.evaluate(frame, selector)?;
-                            let right = self.evaluate(frame, label)?;
-                            if binary(Op::Eq, left, right, label.1)?.as_bool(label.1)? {
+                            if self
+                                .evaluate_binary(frame, Op::Eq, selector, label, label.1)?
+                                .as_bool(label.1)?
+                            {
                                 self.block(frame, body)?;
                                 break 'cases;
                             }
@@ -385,7 +425,9 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
             let address = frame.get(name.to_uppercase().as_str())?;
             let slot = address.slot.borrow();
             let (value, dimensions) = if let Some(array) = &slot.array {
-                if let Some(index) = address.index.as_deref().or(subscript) {
+                if let Some(index) = &address.index {
+                    (array.values.get(index), Vec::new())
+                } else if let Some(index) = subscript {
                     if index.len() != array.dimensions.len()
                         || index
                             .iter()
@@ -394,7 +436,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                     {
                         return None;
                     }
-                    (array.values.get(index), Vec::new())
+                    let key = index.iter().map(i32::to_string).collect::<Vec<_>>();
+                    (array.values.get(&key), Vec::new())
                 } else {
                     (None, array.dimensions.clone())
                 }
@@ -464,13 +507,16 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         }
         let mut index = Vec::with_capacity(indexes.len());
         for (expr, upper) in indexes.iter().zip(bounds) {
-            let value = self.evaluate(frame, expr)?.as_number(expr.1)? as i32;
-            if value < 1 || value > upper {
-                return Err(expr
-                    .1
-                    .error(format!("Subíndice ({value}) fuera de rango (1...{upper}).")));
+            let value = self.evaluate(frame, expr)?;
+            let truncated = value.as_number(expr.1)? as i32;
+            let subscript = value.display();
+            if truncated < 1 || truncated > upper {
+                return Err(expr.1.error(format!(
+                    "Subíndice ({subscript}) fuera de rango (1...{upper})."
+                )));
             }
-            index.push(value);
+            // The reference checks the truncated index and uses the displayed value as its key.
+            index.push(subscript);
         }
         address.index = Some(index);
         Ok(address)
@@ -524,36 +570,81 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
     }
 
     fn condition(&mut self, frame: &mut Frame<'a>, expr: &Expr<'a>) -> Result<bool, Diagnostic> {
-        self.evaluate(frame, expr)?.as_bool(expr.1)
+        self.evaluate_as(frame, expr, Type::Logic)?.as_bool(expr.1)
     }
 
-    fn evaluate(
+    fn is_callable(&self, name: &str) -> bool {
+        builtins::signature(name).is_some()
+            || self
+                .program
+                .routines
+                .iter()
+                .any(|routine| routine.name.0 == name)
+    }
+
+    fn constrain_expression(
+        &self,
+        frame: &mut Frame<'a>,
+        expr: &Expr<'a>,
+        ty: Type,
+    ) -> Result<(), Diagnostic> {
+        match &expr.0 {
+            Expression::Variable(place) if !self.is_callable(place.0.0) => {
+                Self::slot(frame, place.0).constrain(ty, expr.1)
+            }
+            Expression::Unary(Op::Plus | Op::Minus, operand) => {
+                self.constrain_expression(frame, operand, ty)
+            }
+            Expression::Binary(Op::Plus, left, right) => {
+                self.constrain_expression(frame, left, ty)?;
+                self.constrain_expression(frame, right, ty)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn evaluate_as(
         &mut self,
         frame: &mut Frame<'a>,
-        Expr(expr, at): &Expr<'a>,
+        expr: &Expr<'a>,
+        ty: Type,
+    ) -> Result<Value, Diagnostic> {
+        self.constrain_expression(frame, expr, ty)?;
+        self.evaluate(frame, expr)
+    }
+
+    fn evaluate(&mut self, frame: &mut Frame<'a>, expr: &Expr<'a>) -> Result<Value, Diagnostic> {
+        self.nested(expr.1, |runtime| runtime.evaluate_inner(frame, expr))
+    }
+
+    fn evaluate_inner(
+        &mut self,
+        frame: &mut Frame<'a>,
+        Expr(expr, at, _): &Expr<'a>,
     ) -> Result<Value, Diagnostic> {
         Ok(match expr {
             Expression::Literal(value) => value.clone(),
             Expression::Variable(place) => {
-                if builtins::signature(place.0.0).is_some()
-                    || self
-                        .program
-                        .routines
-                        .iter()
-                        .any(|routine| routine.name.0 == place.0.0)
-                {
+                if self.is_callable(place.0.0) {
                     self.call(frame, place)?
                 } else {
-                    self.address(frame, place, false)?.get()
+                    self.address(frame, place, false)?.get(*at)?
                 }
             }
             Expression::IsInteger(operand) => {
-                let left = self.evaluate(frame, operand)?.as_number(*at)?;
+                let left = self
+                    .evaluate_as(frame, operand, Type::Real)?
+                    .as_number(*at)?;
                 let right = self.evaluate(frame, operand)?.as_number(*at)?;
                 Value::Logic((left - f64::from(builtins::trunc(right))).abs() < 1e-11)
             }
             Expression::Unary(op, operand) => {
-                let value = self.evaluate(frame, operand)?;
+                let expected = if *op == Op::Not {
+                    Type::Logic
+                } else {
+                    Type::Real
+                };
+                let value = self.evaluate_as(frame, operand, expected)?;
                 match op {
                     Op::Not => Value::Logic(!value.as_bool(*at)?),
                     Op::Plus => Value::Number(value.as_number(*at)?),
@@ -562,17 +653,38 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 }
             }
             Expression::Binary(Op::And, left, right) => {
+                self.constrain_expression(frame, right, Type::Logic)?;
                 Value::Logic(self.condition(frame, left)? && self.condition(frame, right)?)
             }
             Expression::Binary(Op::Or, left, right) => {
+                self.constrain_expression(frame, right, Type::Logic)?;
                 Value::Logic(self.condition(frame, left)? || self.condition(frame, right)?)
             }
             Expression::Binary(op, left, right) => {
-                let left = self.evaluate(frame, left)?;
-                let right = self.evaluate(frame, right)?;
-                binary(*op, left, right, *at)?
+                self.evaluate_binary(frame, *op, left, right, *at)?
             }
         })
+    }
+
+    fn evaluate_binary(
+        &mut self,
+        frame: &mut Frame<'a>,
+        op: Op,
+        left: &Expr<'a>,
+        right: &Expr<'a>,
+        at: Position,
+    ) -> Result<Value, Diagnostic> {
+        if matches!(op, Op::Minus | Op::Times | Op::Divide | Op::Power | Op::Mod) {
+            self.constrain_expression(frame, left, Type::Real)?;
+            self.constrain_expression(frame, right, Type::Real)?;
+        }
+        let left_value = self.evaluate(frame, left)?;
+        let right_value = self.evaluate(frame, right)?;
+        if let Some(ty) = left_value.ty().or_else(|| right_value.ty()) {
+            self.constrain_expression(frame, left, ty)?;
+            self.constrain_expression(frame, right, ty)?;
+        }
+        binary(op, left_value, right_value, at)
     }
 
     fn call(
@@ -584,7 +696,12 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         if let Some(signature) = builtins::signature(name) {
             let mut values = Vec::with_capacity(args.len());
             for (arg, ty) in args.iter().zip(signature.params) {
-                let value = self.evaluate(frame, arg)?;
+                let expected = if *ty == Type::Integer {
+                    Type::Real
+                } else {
+                    *ty
+                };
+                let value = self.evaluate_as(frame, arg, expected)?;
                 if !(match ty {
                     Type::Integer => value.as_number(arg.1).is_ok(),
                     ty => ty.accepts(&value),
@@ -601,15 +718,11 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
             .iter()
             .find(|routine| routine.name.0 == *name)
             .ok_or_else(|| at.error(format!("Subproceso no definido ({name}).")))?;
-        let mut locals = seed_frame(&self.types[name]);
+        // Explicit declarations and expression types take effect as this invocation executes.
+        let mut locals = Frame::new();
         for (arg, (param, passage)) in args.iter().zip(&routine.params) {
             let place = match &arg.0 {
-                Expression::Variable(place)
-                    if builtins::signature(place.0.0).is_none()
-                        && !self.program.routines.iter().any(|r| r.name.0 == place.0.0) =>
-                {
-                    Some(place)
-                }
+                Expression::Variable(place) if !self.is_callable(place.0.0) => Some(place),
                 _ => None,
             };
             let is_array = place
@@ -627,14 +740,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 self.address(frame, reference, true)?
             } else {
                 let value = self.evaluate(frame, arg)?;
-                let ty = locals
-                    .get(param.0)
-                    .and_then(Address::ty)
-                    .or_else(|| value.ty());
-                if ty.is_some_and(|ty| !ty.accepts(&value)) {
-                    return Err(arg.1.error("Tipo de dato incorrecto en el argumento."));
-                }
-                Address::new(ty, value)
+                Address::new(value.ty(), value)
             };
             locals.insert(param.0, actual);
         }
@@ -651,9 +757,10 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
             });
             diagnostic
         })?;
-        Ok(routine
-            .result
-            .map_or(Value::Empty, |name| Self::slot(&mut locals, name).get()))
+        match routine.result {
+            Some(name) => Self::slot(&mut locals, name).get(name.1),
+            None => Ok(Value::Empty),
+        }
     }
 }
 

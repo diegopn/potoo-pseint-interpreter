@@ -12,6 +12,9 @@ use std::fmt;
 use std::io::{self, BufRead, Write};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+// Parser and evaluator recursion share this bound with the expression tree height.
+const MAX_NESTING: usize = 64;
+
 #[derive(Clone, Copy, Debug)]
 struct Position {
     line: usize,

@@ -6,7 +6,7 @@ use crate::parser::{
 };
 use crate::{Diagnostic, Position};
 
-pub(crate) type Types<'a> = HashMap<&'a str, HashMap<&'a str, Type>>;
+pub(crate) type Types<'a> = HashMap<&'a str, Type>;
 
 const NUMERIC: u8 = 1;
 const TEXT: u8 = 2;
@@ -14,6 +14,7 @@ const LOGIC: u8 = 4;
 const ALL: u8 = NUMERIC | TEXT | LOGIC;
 
 type Variable = usize;
+type TypeFlow = (Variable, Variable, Position);
 
 struct TypeVariable {
     parent: Variable,
@@ -78,6 +79,23 @@ impl Constraints {
         let root = self.root(id);
         self.0[root].possibilities
     }
+
+    fn propagate(&mut self, flows: &[TypeFlow]) -> Result<(), Diagnostic> {
+        loop {
+            let mut changed = false;
+            for &(source, target, at) in flows {
+                let allowed = self.possibilities(source);
+                let before = self.possibilities(target);
+                if before & allowed != before {
+                    self.require(target, allowed, at)?;
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -92,9 +110,8 @@ struct Checker<'a, 'program> {
     constraints: Constraints,
     program: &'program Program<'a>,
     returns: HashMap<&'a str, Variable>,
-    scopes: HashMap<&'a str, Scope<'a>>,
-    arguments: Vec<(&'a str, usize, Variable, Position)>,
-    flows: Vec<(Variable, Variable, Position)>,
+    flows: Vec<TypeFlow>,
+    arguments: Vec<((&'a str, &'a str), Variable, Position)>,
 }
 
 pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> {
@@ -102,9 +119,8 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
         constraints: Constraints::default(),
         program,
         returns: HashMap::new(),
-        scopes: HashMap::new(),
-        arguments: Vec::new(),
         flows: Vec::new(),
+        arguments: Vec::new(),
     };
     let mut routine_names = HashSet::from([program.main.name.0]);
     if builtins::signature(program.main.name.0).is_some() {
@@ -125,65 +141,43 @@ pub(crate) fn check<'a>(program: &Program<'a>) -> Result<Types<'a>, Diagnostic> 
             checker.returns.insert(name, checker.constraints.new(ALL));
         }
     }
-    for routine in program
-        .routines
-        .iter()
-        .chain(std::iter::once(&program.main))
-    {
-        checker.scope(routine)?;
-    }
-    for (routine, index, actual, at) in checker.arguments {
-        let param = program
-            .routines
-            .iter()
-            .find(|r| r.name.0 == routine)
-            .expect("known routine")
-            .params[index]
-            .0;
-        let formal = checker.scopes[routine].variables[param.0];
-        checker.flows.push((formal, actual, at));
-    }
-    // A caller learns the callee's inferred type without imposing its own type on other calls.
-    loop {
-        let mut changed = false;
-        for &(source, target, at) in &checker.flows {
-            let allowed = checker.constraints.possibilities(source);
-            let before = checker.constraints.possibilities(target);
-            if before & allowed != before {
-                checker.constraints.require(target, allowed, at)?;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
+    let mut parameters = HashMap::new();
+    for routine in &program.routines {
+        let scope = checker.scope(routine)?;
+        for (param, _) in &routine.params {
+            parameters.insert((routine.name.0, param.0), scope.variables[param.0]);
         }
     }
-    Ok(checker
-        .scopes
+    let main = checker.scope(&program.main)?;
+    checker.constraints.propagate(&checker.flows)?;
+    // Parameter constraints validate calls without assigning a runtime type before the call.
+    let main_types = main
+        .variables
         .into_iter()
-        .map(|(name, scope)| {
-            let inferred = scope
-                .variables
-                .into_iter()
-                .filter_map(|(name, variable)| {
-                    let ty = scope.explicit.get(name).copied().or_else(|| {
-                        match checker.constraints.possibilities(variable) {
-                            NUMERIC => Some(Type::Real),
-                            TEXT => Some(Type::Text),
-                            LOGIC => Some(Type::Logic),
-                            _ => None,
-                        }
-                    });
-                    ty.map(|ty| (name, ty))
-                })
-                .collect();
-            (name, inferred)
+        .filter_map(|(name, variable)| {
+            let ty = main.explicit.get(name).copied().or_else(|| {
+                match checker.constraints.possibilities(variable) {
+                    NUMERIC => Some(Type::Real),
+                    TEXT => Some(Type::Text),
+                    LOGIC => Some(Type::Logic),
+                    _ => None,
+                }
+            });
+            ty.map(|ty| (name, ty))
         })
-        .collect())
+        .collect();
+    checker.flows.extend(
+        checker
+            .arguments
+            .into_iter()
+            .map(|(parameter, actual, at)| (parameters[&parameter], actual, at)),
+    );
+    checker.constraints.propagate(&checker.flows)?;
+    Ok(main_types)
 }
 
 impl<'a> Checker<'a, '_> {
-    fn scope(&mut self, routine: &Routine<'a>) -> Result<(), Diagnostic> {
+    fn scope(&mut self, routine: &Routine<'a>) -> Result<Scope<'a>, Diagnostic> {
         let mut scope = Scope::default();
         for &(name, _) in &routine.params {
             if !scope.parameters.insert(name.0) {
@@ -197,8 +191,7 @@ impl<'a> Checker<'a, '_> {
                 .unify(variable, self.returns[routine.name.0], name.1)?;
         }
         self.block(&mut scope, &routine.body)?;
-        self.scopes.insert(routine.name.0, scope);
-        Ok(())
+        Ok(scope)
     }
 
     fn variable(
@@ -277,6 +270,9 @@ impl<'a> Checker<'a, '_> {
                 }
                 Statement::Dimension(arrays) => {
                     for Place(name, dimensions) in arrays {
+                        if scope.parameters.contains(name.0) {
+                            return Err(name.1.error("No debe redimensionar un argumento."));
+                        }
                         self.variable(scope, *name)?;
                         let dimensions =
                             dimensions.as_ref().expect("dimensions required by parser");
@@ -368,7 +364,7 @@ impl<'a> Checker<'a, '_> {
     fn expression(
         &mut self,
         scope: &mut Scope<'a>,
-        Expr(expr, at): &Expr<'a>,
+        Expr(expr, at, _): &Expr<'a>,
     ) -> Result<Variable, Diagnostic> {
         use Op::*;
         let id = match expr {
@@ -461,8 +457,8 @@ impl<'a> Checker<'a, '_> {
             }
             _ => {}
         }
-        for (index, (arg, (_, passage))) in args.iter().zip(&routine.params).enumerate() {
-            let id = if let Expression::Variable(place) = &arg.0
+        for (arg, (param, passage)) in args.iter().zip(&routine.params) {
+            let actual = if let Expression::Variable(place) = &arg.0
                 && self.routine(place.0.0).is_none()
                 && builtins::signature(place.0.0).is_none()
             {
@@ -481,7 +477,8 @@ impl<'a> Checker<'a, '_> {
                 }
                 self.expression(scope, arg)?
             };
-            self.arguments.push((routine.name.0, index, id, arg.1));
+            self.arguments
+                .push(((routine.name.0, param.0), actual, arg.1));
         }
         if let Some(&result) = self.returns.get(name) {
             let declared = self.constraints.possibilities(result);
