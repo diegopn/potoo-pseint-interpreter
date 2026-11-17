@@ -13,6 +13,7 @@ pub(crate) enum Type {
 pub(crate) struct TypeSet(u8);
 
 impl TypeSet {
+    pub const EMPTY: Self = Self(0);
     pub const NUMBER: Self = Self(1);
     pub const LOGIC: Self = Self(2);
     pub const TEXT: Self = Self(4);

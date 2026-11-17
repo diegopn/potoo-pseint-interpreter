@@ -607,8 +607,8 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                 runtime.constrain_expression(frame, operand, allowed)
             }
             Expression::Binary(Op::Plus, left, right) => {
-                let current = runtime.determine_sum_types(frame, left, right, expr.1)?;
-                if current.intersection(allowed) == Some(current) {
+                let current = runtime.determine_sum_types(frame, left, right)?;
+                if current == TypeSet::EMPTY || current.intersection(allowed) == Some(current) {
                     return Ok(());
                 }
                 runtime.constrain_expression(frame, left, allowed)?;
@@ -713,7 +713,7 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
                     TypeSet::LOGIC
                 }
                 Expression::Binary(Plus, left, right) => {
-                    runtime.determine_sum_types(frame, left, right, expr.1)?
+                    runtime.determine_sum_types(frame, left, right)?
                 }
                 Expression::Unary(..) | Expression::Binary(..) => TypeSet::NUMBER,
             })
@@ -725,11 +725,10 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
         frame: &Frame<'a>,
         left: &Expr<'a>,
         right: &Expr<'a>,
-        at: Position,
     ) -> Result<TypeSet, Diagnostic> {
         let left = self.determine_types(frame, left)?;
         let right = self.determine_types(frame, right)?;
-        addition_types(left, right, at)
+        Ok(addition_types(left, right).unwrap_or(TypeSet::EMPTY))
     }
 
     fn evaluate_addend(
@@ -757,7 +756,14 @@ impl<'a, R: BufRead, W: Write, H: Host> Runtime<'a, '_, R, W, H> {
     ) -> Result<Value, Diagnostic> {
         let left_types = self.determine_types(frame, left)?;
         let right_types = self.determine_types(frame, right)?;
-        let allowed = addition_types(left_types, right_types, at)?;
+        if left_types == TypeSet::EMPTY || right_types == TypeSet::EMPTY {
+            // Evaluation reaches the invalid operand in source order and reports its own error.
+            self.evaluate(frame, left)?;
+            self.evaluate(frame, right)?;
+            return Err(addition_type_error(at));
+        }
+        let allowed =
+            addition_types(left_types, right_types).ok_or_else(|| addition_type_error(at))?;
         if left_types != allowed {
             self.constrain_expression(frame, left, allowed)?;
         }
@@ -976,10 +982,9 @@ impl Value {
     }
 }
 
-fn addition_types(left: TypeSet, right: TypeSet, at: Position) -> Result<TypeSet, Diagnostic> {
+fn addition_types(left: TypeSet, right: TypeSet) -> Option<TypeSet> {
     left.intersection(right)
         .and_then(|possible| possible.intersection(TypeSet::TEXT_OR_NUMBER))
-        .ok_or_else(|| addition_type_error(at))
 }
 
 fn addition_type_error(at: Position) -> Diagnostic {
