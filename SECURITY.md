@@ -14,4 +14,4 @@ For non-security issues, see [CONTRIBUTING.md](CONTRIBUTING.md). For conduct con
 
 ## Security boundaries
 
-The repository currently contains only a crate scaffold and does not execute PSeInt source. This policy will be updated with the runtime boundaries and resource limits before source execution is implemented. When execution is introduced, hosts running untrusted source should apply process isolation; resource limits alone are not an operating-system sandbox.
+The interpreter executes PSeInt source in the calling process. It does not create an operating-system sandbox or enforce general CPU or memory quotas. The CLI reads the selected source file and uses the process's standard input and output; an embedding `Host` supplies the runtime services it implements. Nesting and call-depth limits are implementation guards, not isolation. Run untrusted source in a restricted process with operating-system access and resource limits.
