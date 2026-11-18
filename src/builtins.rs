@@ -147,14 +147,15 @@ pub(crate) fn display_number(value: f64) -> String {
 pub(crate) fn decimal(text: &str) -> Option<f64> {
     let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
     let mut dot = false;
+    let mut has_digit = false;
     for b in digits.bytes() {
         match b {
             b'.' if !dot => dot = true,
-            b'0'..=b'9' => {}
+            b'0'..=b'9' => has_digit = true,
             _ => return None,
         }
     }
-    Some(text.parse().unwrap_or(0.0))
+    has_digit.then(|| text.parse().ok()).flatten()
 }
 
 pub(crate) fn trunc(number: f64) -> i32 {

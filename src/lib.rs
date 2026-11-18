@@ -106,14 +106,14 @@ pub trait Host {
         output.flush()
     }
 
-    /// Reads one line for `Leer` after the interpreter writes and flushes its prompt.
+    /// Reads one line for `Leer` after the prompt is flushed, decoding UTF-8 or ISO-8859-1.
     fn read_line(
         &mut self,
         input: &mut dyn BufRead,
         _output: &mut dyn Write,
         line: &mut String,
     ) -> io::Result<usize> {
-        input.read_line(line)
+        read_line_utf8_or_latin1(input, line)
     }
 
     /// Suspends execution until a key is available.
@@ -140,6 +140,19 @@ pub trait Host {
             .unwrap_or_default()
             .as_secs() as u32
     }
+}
+
+fn read_line_utf8_or_latin1(input: &mut dyn BufRead, line: &mut String) -> io::Result<usize> {
+    let mut bytes = Vec::new();
+    let count = input.read_until(b'\n', &mut bytes)?;
+    if count == 0 {
+        return Ok(0);
+    }
+    match String::from_utf8(bytes) {
+        Ok(value) => line.push_str(&value),
+        Err(error) => line.extend(error.into_bytes().into_iter().map(char::from)),
+    }
+    Ok(count)
 }
 
 struct Console;

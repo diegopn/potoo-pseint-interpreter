@@ -75,3 +75,26 @@ fn check_reports_source_coordinates_for_invalid_structure() {
     assert_eq!(diagnostic.line, 3);
     assert!(diagnostic.column > 0);
 }
+
+#[test]
+fn convertir_a_numero_rejects_a_decimal_point_without_digits() {
+    let source = "Algoritmo Demo\nEscribir ConvertirANumero(\".\")\nFinAlgoritmo";
+    let mut input = Cursor::new(Vec::new());
+    let mut output = Vec::new();
+
+    let diagnostic = run(source, &mut input, &mut output).unwrap_err();
+
+    assert!(diagnostic.message.contains("no representa un número"));
+}
+
+#[test]
+fn default_host_decodes_latin1_runtime_input_as_unicode() {
+    let source =
+        "Algoritmo Eco\nDefinir texto Como Caracter\nLeer texto\nEscribir texto\nFinAlgoritmo";
+    let mut input = Cursor::new(b"ni\xf1o\n".to_vec());
+    let mut output = Vec::new();
+
+    run(source, &mut input, &mut output).unwrap();
+
+    assert_eq!(String::from_utf8(output).unwrap(), "> niño\n");
+}

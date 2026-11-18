@@ -59,7 +59,12 @@ impl Host for Terminal {
         } else if self.no_input {
             Ok(0)
         } else {
-            input.read_line(line)
+            let mut bytes = Vec::new();
+            let count = input.read_until(b'\n', &mut bytes)?;
+            if count > 0 {
+                line.push_str(&decode_utf8_or_latin1(bytes));
+            }
+            Ok(count)
         }
     }
 
@@ -160,8 +165,7 @@ fn main() -> ExitCode {
     };
 
     let source = match fs::read(&path) {
-        Ok(bytes) => String::from_utf8(bytes)
-            .unwrap_or_else(|err| err.into_bytes().into_iter().map(char::from).collect()),
+        Ok(bytes) => decode_utf8_or_latin1(bytes),
         Err(err) => {
             eprintln!("{}: {err}", path.display());
             return ExitCode::FAILURE;
@@ -185,4 +189,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS
+}
+
+fn decode_utf8_or_latin1(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap_or_else(|err| err.into_bytes().into_iter().map(char::from).collect())
 }

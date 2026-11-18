@@ -105,7 +105,17 @@ potoo-pseint --nouser --input=4 --noinput cuenta.psc
 potoo-pseint --nouser --seed=42 cuenta.psc
 ```
 
-The CLI reads UTF-8 and falls back to ISO-8859-1 when needed. Program input and output use the terminal.
+The CLI reads UTF-8 source files and falls back to ISO-8859-1 when the file is not valid UTF-8. Each line read from standard input follows the same rule. Program input and output use the terminal.
+
+## Compatibility decisions
+
+This implementation targets only the original version 20220506 `<predeterminado>` profile; it does not claim compatibility with other configurable profiles. A few host-independent choices are explicit:
+
+- The library counts Unicode scalar values for `Longitud` and `SubCadena`. Precomposed ISO-8859-1 characters therefore occupy one position. Combining sequences and supplementary characters can differ from some original builds; this implementation keeps one Unicode model across host platforms.
+- Seeded random draws follow the Linux libc sequence on every host to keep seeded programs reproducible. Results can differ from an original build using another C runtime.
+- Parsing and execution stop at 64 active nested levels and return a source diagnostic. This is an implementation safety policy, not a PSeInt language restriction, and can reject deeper programs accepted by the original.
+
+Bytes valid under both encodings are interpreted as UTF-8. The default library host applies the same fallback to input lines; custom hosts provide Unicode strings.
 
 ## Use as a Rust library
 
