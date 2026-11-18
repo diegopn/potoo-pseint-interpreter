@@ -39,8 +39,8 @@ jobs:
         with:
           ref: ${{ github.sha }}
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test --all-targets
-      - run: cargo build --release --bin potoo-pseint
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release --bin potoo-pseint
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash
