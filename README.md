@@ -60,7 +60,7 @@ FinAlgoritmo
 Install [Rust and Cargo](https://www.rust-lang.org/tools/install) first. This project requires Rust 1.93 or newer.
 
 ```sh
-git clone --branch develop https://github.com/diegopn/potoo-pseint-interpreter.git
+git clone --branch main https://github.com/diegopn/potoo-pseint-interpreter.git
 cd potoo-pseint-interpreter
 cargo install --path . --locked --bin potoo-pseint
 ```
