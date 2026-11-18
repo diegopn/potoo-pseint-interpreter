@@ -45,6 +45,52 @@ cargo run --locked --bin potoo-pseint -- cuenta.psc
 
 The CLI displays PSeInt's execution messages. Pass `--nouser` to obtain only program output or `--norun` to check the program. Use `--input=VALUE` more than once to provide successive values to `Leer`, and add `--noinput` to use only those values. `--seed=N` sets the seed for repeatable random draws.
 
+## Install the command-line runner
+
+Install [Rust and Cargo](https://www.rust-lang.org/tools/install) first. This project requires Rust 1.93 or newer.
+
+```sh
+git clone --branch develop https://github.com/diegopn/potoo-pseint-interpreter.git
+cd potoo-pseint-interpreter
+cargo install --path . --locked --bin potoo-pseint
+```
+
+Cargo places the executable in its configured binary directory, usually `~/.cargo/bin`. Add that directory to your `PATH` if the `potoo-pseint` command is not found.
+
+To build without installing:
+
+```sh
+cargo build --release --locked --bin potoo-pseint
+```
+
+The executable is written to `target/release/` (`potoo-pseint.exe` on Windows).
+
+## Use the command-line runner
+
+The runner accepts one `.psc` source file and these options:
+
+```text
+potoo-pseint [--nouser] [--norun] [--seed=N] [--input=VALUE] [--noinput] <file.psc>
+```
+
+- `--nouser` suppresses the CLI's checking, start, and finish messages, leaving program output visible.
+- `--norun` checks syntax and types without executing the program.
+- `--input=VALUE` supplies one value to the next `Leer`. Repeat the option for additional reads.
+- `--noinput` makes execution use only the supplied values instead of waiting on standard input.
+- `--seed=N` supplies a repeatable seed for `Azar` and `Aleatorio`. `--seed=-1` uses a time-based seed.
+- `--help` prints the usage line. Invalid options and argument counts return status 2; source and runtime errors return a failure status with a file and source location.
+
+Examples:
+
+```sh
+potoo-pseint cuenta.psc
+potoo-pseint --norun cuenta.psc
+potoo-pseint --nouser --input=4 --noinput cuenta.psc
+potoo-pseint --nouser --seed=42 cuenta.psc
+```
+
+The CLI reads UTF-8 and falls back to ISO-8859-1 when the file is not valid UTF-8. It uses the terminal for program input and output. Interactive key waiting on Unix uses `stty` when standard input is a terminal; stream input consumes the next byte instead.
+
 ## Language and runtime
 
 - `Algoritmo` and `Proceso` define the entry point. Identifiers are case insensitive and can use Spanish accented letters, digits after the first character, and underscores. Source supports `//` comments, optional semicolons for sequential statements, and spaced closing keywords such as `Fin Si`.
@@ -60,6 +106,39 @@ The CLI displays PSeInt's execution messages. Pass `--nouser` to obtain only pro
 ## Library integration
 
 Use `potoo_pseint_interpreter::check` for source validation or `run` to execute a UTF-8 program with caller-supplied input and output streams. `run_with_host` accepts a `Host` for reading input, clearing the console, waiting, seeding random draws, and receiving execution events. The host can pause or cancel at a source location and inspect local variables or array elements through `Step`. Source diagnostics include one-based line and column positions and preserve the caller locations of runtime errors in subprograms.
+
+Add a local checkout as a path dependency:
+
+```toml
+[dependencies]
+potoo-pseint-interpreter = { path = "../potoo-pseint-interpreter" }
+```
+
+This example checks and runs a program with caller-owned input and output streams:
+
+```rust
+use std::io::{self, Cursor};
+use potoo_pseint_interpreter::{check, run};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let source = r#"
+Algoritmo Suma
+    Definir a, b Como Enteros
+    Leer a, b
+    Escribir a + b
+FinAlgoritmo
+"#;
+
+    check(source)?;
+    let mut input = Cursor::new("2\n3\n");
+    let mut output = Vec::new();
+    run(source, &mut input, &mut output)?;
+    print!("{}", String::from_utf8(output)?);
+    Ok(())
+}
+```
+
+For IDE integration, implement `Host` and call `run_with_host`. The host receives `on_line` callbacks before statements execute; `Step::variable` reads current scalar or array values. Override input, console clearing, waits, random seeding, or execution callbacks to match the embedding environment. The built-in `run` entry point uses the default console host.
 
 The parser and runtime cap nested blocks, expressions, and calls at 64 active levels. The parser also caps expression tree height at 64, including chains of binary operators. Each level uses the Rust thread stack, where an overflow can abort the host process. A positioned diagnostic reports a program that exceeds the cap.
 
@@ -82,8 +161,15 @@ Run these commands from the repository root:
 ```sh
 cargo fmt --all -- --check
 cargo check --locked
+cargo test --locked
 git diff --check
 ```
+
+The integration tests in `tests/` exercise validation, source diagnostics, execution with input/output streams, host inspection callbacks, and the command-line flags.
+
+## Support
+
+If this project is useful to you, you can [sponsor its maintainer](https://github.com/sponsors/diegopn).
 
 ## Project policies
 
