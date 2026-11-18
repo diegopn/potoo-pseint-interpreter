@@ -6,7 +6,7 @@ rust-version = "1.93"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/diegopn/potoo-pseint-interpreter"
 readme = "README.md"
-description = "Initial scaffold for an independent Rust interpreter for the PSeInt pseudolanguage"
+description = "Independent Rust interpreter for the PSeInt default profile"
 
 [lib]
 path = "src/lib.rs"
