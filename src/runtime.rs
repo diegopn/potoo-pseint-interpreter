@@ -1078,10 +1078,29 @@ fn addition_number(value: &Value, at: Position) -> Result<f64, Diagnostic> {
         _ => return value.as_number(at),
     };
     // Numeric addition uses numeric string conversion after choosing a compatible operand type.
-    let text = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
-    if let Ok(number) = text.parse() {
-        return Ok(number);
+    Ok(c_atof(text))
+}
+
+fn c_atof(text: &str) -> f64 {
+    let text = text.trim_start_matches(|ch: char| ch.is_ascii_whitespace());
+    let (negative, unsigned) = match text.strip_prefix(['+', '-']) {
+        Some(unsigned) => (text.starts_with('-'), unsigned),
+        None => (false, text),
+    };
+    let signed = |number: f64| if negative { -number } else { number };
+
+    if starts_ascii_case_insensitive(unsigned, "infinity")
+        || starts_ascii_case_insensitive(unsigned, "inf")
+    {
+        return signed(f64::INFINITY);
     }
+    if starts_ascii_case_insensitive(unsigned, "nan") {
+        return signed(f64::NAN);
+    }
+    if let Some(number) = hex_float_prefix(unsigned) {
+        return signed(number);
+    }
+
     let mut end = 0;
     let mut dot = false;
     for (index, byte) in text.bytes().enumerate() {
@@ -1105,7 +1124,151 @@ fn addition_number(value: &Value, at: Position) -> Result<f64, Diagnostic> {
         }
         end = index + 1;
     }
-    Ok(text[..end].parse().unwrap_or(0.0))
+    text[..end].parse().unwrap_or(0.0)
+}
+
+fn starts_ascii_case_insensitive(text: &str, prefix: &str) -> bool {
+    text.get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn hex_float_prefix(text: &str) -> Option<f64> {
+    let text = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))?;
+    let mut cursor = 0;
+    let mut after_dot = false;
+    let mut fractional_digits = 0usize;
+    let mut digits = Vec::new();
+    for byte in text.bytes() {
+        if let Some(digit) = hex_digit(byte) {
+            digits.push(digit);
+            if after_dot {
+                fractional_digits = fractional_digits.saturating_add(1);
+            }
+            cursor += 1;
+        } else if byte == b'.' && !after_dot {
+            after_dot = true;
+            cursor += 1;
+        } else {
+            break;
+        }
+    }
+    if digits.is_empty() {
+        return None;
+    }
+
+    let binary_exponent = text[cursor..]
+        .strip_prefix(['p', 'P'])
+        .and_then(parse_signed_integer_prefix);
+    if !after_dot && binary_exponent.is_none() {
+        return None;
+    }
+    let binary_exponent = binary_exponent.unwrap_or(0);
+    let first_significant = digits.iter().position(|digit| *digit != 0);
+    let Some(first_significant) = first_significant else {
+        return Some(0.0);
+    };
+    let mut bits = Vec::with_capacity((digits.len() - first_significant) * 4);
+    for digit in &digits[first_significant..] {
+        for bit in (0..4).rev() {
+            bits.push(digit & (1 << bit) != 0);
+        }
+    }
+    let fractional_digits = i64::try_from(fractional_digits).unwrap_or(i64::MAX);
+    let binary_scale = binary_exponent.saturating_sub(fractional_digits.saturating_mul(4));
+    Some(binary_integer_to_f64(&bits, binary_scale))
+}
+
+fn binary_integer_to_f64(bits: &[bool], scale: i64) -> f64 {
+    let bit_length = i64::try_from(bits.len()).unwrap_or(i64::MAX);
+    let exponent = scale.saturating_add(bit_length.saturating_sub(1));
+    if exponent > 1023 {
+        return f64::INFINITY;
+    }
+
+    if exponent >= -1022 {
+        let mut significand = leading_bits(bits, 53);
+        if bits.len() < 53 {
+            significand <<= 53 - bits.len();
+        } else if bits.len() > 53 {
+            let guard = bits[53];
+            let sticky = bits[54..].iter().any(|bit| *bit);
+            if guard && (sticky || significand & 1 != 0) {
+                significand += 1;
+            }
+        }
+        let exponent = if significand == 1 << 53 {
+            significand >>= 1;
+            exponent + 1
+        } else {
+            exponent
+        };
+        if exponent > 1023 {
+            return f64::INFINITY;
+        }
+        return f64::from_bits(((exponent + 1023) as u64) << 52 | (significand & ((1 << 52) - 1)));
+    }
+
+    let subnormal_shift = scale.saturating_add(1074);
+    let mut significand = if subnormal_shift >= 0 {
+        leading_bits(bits, bits.len()) << (subnormal_shift as u32)
+    } else {
+        let discarded = usize::try_from(subnormal_shift.saturating_neg()).unwrap_or(usize::MAX);
+        if discarded > bits.len() {
+            return 0.0;
+        }
+        let retained = bits.len() - discarded;
+        let mut significand = leading_bits(bits, retained);
+        let guard = bits[retained];
+        let sticky = bits[retained + 1..].iter().any(|bit| *bit);
+        if guard && (sticky || significand & 1 != 0) {
+            significand += 1;
+        }
+        significand
+    };
+    if significand > 1 << 52 {
+        significand = 1 << 52;
+    }
+    f64::from_bits(significand)
+}
+
+fn leading_bits(bits: &[bool], count: usize) -> u64 {
+    bits.iter()
+        .take(count)
+        .fold(0, |value, bit| value << 1 | u64::from(*bit))
+}
+
+fn parse_signed_integer_prefix(text: &str) -> Option<i64> {
+    let (negative, digits) = match text.strip_prefix(['+', '-']) {
+        Some(digits) => (text.starts_with('-'), digits),
+        None => (false, text),
+    };
+    let mut value = 0i64;
+    let mut found_digit = false;
+    for byte in digits.bytes().take_while(u8::is_ascii_digit) {
+        found_digit = true;
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i64::from(byte - b'0'));
+    }
+    if !found_digit {
+        return None;
+    }
+    Some(if negative {
+        value.saturating_neg()
+    } else {
+        value
+    })
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn binary(op: Op, left: Value, right: Value, at: Position) -> Result<Value, Diagnostic> {

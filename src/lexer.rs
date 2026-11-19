@@ -111,6 +111,22 @@ pub(crate) fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
                         dot |= next == '.';
                         value.push(next);
                     }
+                    if let Some((_, exponent)) = chars.next_if(|(_, c)| matches!(c, 'e' | 'E')) {
+                        value.push(exponent);
+                        if let Some((_, sign @ ('+' | '-'))) =
+                            chars.next_if(|(_, c)| matches!(c, '+' | '-'))
+                        {
+                            value.push(sign);
+                        }
+                        let mut exponent_digits = 0;
+                        while let Some((_, digit)) = chars.next_if(|(_, c)| c.is_ascii_digit()) {
+                            value.push(digit);
+                            exponent_digits += 1;
+                        }
+                        if exponent_digits == 0 {
+                            return Err(at.error("invalid number"));
+                        }
+                    }
                     Number(
                         value
                             .parse::<f64>()
