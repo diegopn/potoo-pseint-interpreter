@@ -117,6 +117,8 @@ This implementation targets only the original version 20220506 `<predeterminado>
 
 Bytes valid under both encodings are interpreted as UTF-8. The default library host applies the same fallback to input lines; custom hosts provide Unicode strings.
 
+See [reference coverage](REFERENCE-COVERAGE.md) for the selected language profile, tests, and compatibility boundaries.
+
 ## Use as a Rust library
 
 Use `potoo_pseint_interpreter::check` for source validation or `run` to execute a UTF-8 program with caller-supplied input and output streams. `run_with_host` accepts a `Host` for reading input, clearing the console, waiting, seeding random draws, and receiving execution events. The host can pause or cancel at a source location and inspect local variables or array elements through `Step`. Source diagnostics include one-based line and column positions and preserve the caller locations of runtime errors in subprograms.
