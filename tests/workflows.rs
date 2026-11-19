@@ -20,11 +20,12 @@ fn ci_checks_all_supported_operating_systems_with_the_lockfile() {
 }
 
 #[test]
-fn release_builds_binaries_for_linux_windows_and_macos() {
+fn release_builds_locked_binaries_for_native_linux_windows_and_macos_targets() {
     for target in [
         "x86_64-unknown-linux-gnu",
         "x86_64-pc-windows-msvc",
         "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
     ] {
         assert!(
             RELEASE_WORKFLOW.contains(target),
@@ -33,5 +34,8 @@ fn release_builds_binaries_for_linux_windows_and_macos() {
     }
 
     assert!(RELEASE_WORKFLOW.contains("cargo test --locked --all-targets"));
-    assert!(RELEASE_WORKFLOW.contains("cargo build --locked --release --bin potoo-pseint"));
+    assert!(RELEASE_WORKFLOW.contains(
+        "cargo build --release --locked --target ${{ matrix.target }} --bin potoo-pseint"
+    ));
+    assert!(RELEASE_WORKFLOW.contains("Verify tag matches package version"));
 }
