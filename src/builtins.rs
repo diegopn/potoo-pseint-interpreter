@@ -145,17 +145,37 @@ pub(crate) fn display_number(value: f64) -> String {
 }
 
 pub(crate) fn decimal(text: &str) -> Option<f64> {
-    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let mut dot = false;
-    let mut has_digit = false;
-    for b in digits.bytes() {
-        match b {
-            b'.' if !dot => dot = true,
-            b'0'..=b'9' => has_digit = true,
-            _ => return None,
+    let bytes = text.as_bytes();
+    let mut cursor = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let mut mantissa_digits = 0;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+        mantissa_digits += 1;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+            mantissa_digits += 1;
         }
     }
-    has_digit.then(|| text.parse().ok()).flatten()
+    if mantissa_digits == 0 {
+        return None;
+    }
+    if matches!(bytes.get(cursor), Some(b'e' | b'E')) {
+        cursor += 1;
+        if matches!(bytes.get(cursor), Some(b'+' | b'-')) {
+            cursor += 1;
+        }
+        let exponent_start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor == exponent_start {
+            return None;
+        }
+    }
+    (cursor == bytes.len()).then(|| text.parse().ok()).flatten()
 }
 
 pub(crate) fn trunc(number: f64) -> i32 {
